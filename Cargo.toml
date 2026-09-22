@@ -1,0 +1,37 @@
+[package]
+name = "pecs-registry"
+version = "0.1.0"
+edition = "2021"
+authors = ["pecs-labs"]
+description = "High-performance, extensible service registry, discovery, and load-balancing framework with zero-lock local snapshot caching for Rust"
+repository = "https://github.com/pecs-labs/pecs-registry"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["registry", "service-discovery", "load-balancer", "etcd", "microservice"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = ["local", "etcd"]
+local = []
+etcd = ["dep:etcd-client"]
+nacos = ["dep:reqwest"]
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+# Etcd provider (optional)
+etcd-client = { version = "0.19", optional = true }
+
+# Nacos HTTP OpenAPI provider (optional)
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
