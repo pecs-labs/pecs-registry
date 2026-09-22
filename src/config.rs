@@ -37,6 +37,15 @@ pub struct RegistryConfig {
     /// 本地快照缓存重拉取间隔（秒）
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl: u64,
+
+    /// 本地磁盘快照持久化容灾目录（可选）
+    /// 当注册中心完全宕机或不可用时，应用可从本地历史快照恢复节点，保障极端情况可用性
+    #[serde(default)]
+    pub disk_cache_dir: Option<String>,
+
+    /// 是否开启本地磁盘快照容灾机制
+    #[serde(default)]
+    pub disk_cache_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -89,6 +98,8 @@ impl Default for RegistryConfig {
             timeout: default_timeout(),
             ttl: default_ttl(),
             cache_ttl: default_cache_ttl(),
+            disk_cache_dir: None,
+            disk_cache_enabled: false,
         }
     }
 }

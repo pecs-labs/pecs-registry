@@ -17,8 +17,8 @@ pub use error::{RegistryError, RegistryResult};
 pub use instance::{Endpoint, ServiceInstance};
 pub use provider::*;
 pub use selector::{
-    RandomSelector, RoundRobinSelector, SelectContext, Selector, TagFilterSelector,
-    WeightedRoundRobinSelector,
+    ConsistentHashSelector, P2CGuard, P2CSelector, RandomSelector, RoundRobinSelector,
+    SelectContext, Selector, TagFilterSelector, WeightedRoundRobinSelector,
 };
 pub use traits::{EventStream, InstanceListener, Registry, ServiceEvent};
 
@@ -201,8 +201,8 @@ pub mod prelude {
     pub use crate::instance::{Endpoint, ServiceInstance};
     pub use crate::provider::local::LocalRegistry;
     pub use crate::selector::{
-        RandomSelector, RoundRobinSelector, SelectContext, Selector, TagFilterSelector,
-        WeightedRoundRobinSelector,
+        ConsistentHashSelector, P2CGuard, P2CSelector, RandomSelector, RoundRobinSelector,
+        SelectContext, Selector, TagFilterSelector, WeightedRoundRobinSelector,
     };
     pub use crate::traits::{EventStream, InstanceListener, Registry, ServiceEvent};
     pub use crate::RegistryService;

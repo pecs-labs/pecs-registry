@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ pub struct RegistryBuilder {
     provider: Option<Arc<dyn Registry>>,
     selector: Option<Arc<dyn Selector>>,
     reconcile_interval: Duration,
+    disk_cache_dir: Option<PathBuf>,
 }
 
 impl RegistryBuilder {
@@ -22,6 +24,7 @@ impl RegistryBuilder {
             provider: None,
             selector: None,
             reconcile_interval: Duration::from_secs(60),
+            disk_cache_dir: None,
         }
     }
 
@@ -50,10 +53,24 @@ impl RegistryBuilder {
         self
     }
 
+    /// 配置本地磁盘快照容灾目录
+    pub fn with_disk_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.disk_cache_dir = Some(path.into());
+        self
+    }
+
     /// 根据统一配置自动装配底层注册中心驱动
     pub fn from_config(config: &RegistryConfig) -> Self {
         let mut builder = Self::new();
         let kind = config.kind.to_lowercase();
+
+        if config.disk_cache_enabled || config.disk_cache_dir.is_some() {
+            if let Some(ref dir) = config.disk_cache_dir {
+                builder.disk_cache_dir = Some(PathBuf::from(dir));
+            } else {
+                builder.disk_cache_dir = Some(PathBuf::from(".registry_cache"));
+            }
+        }
 
         match kind.as_str() {
             #[cfg(feature = "etcd")]
@@ -98,9 +115,10 @@ impl RegistryBuilder {
             .selector
             .unwrap_or_else(|| Arc::new(RoundRobinSelector::new()));
 
-        let directory = Arc::new(ServiceDirectory::with_reconcile_interval(
+        let directory = Arc::new(ServiceDirectory::with_options(
             provider.clone(),
             self.reconcile_interval,
+            self.disk_cache_dir,
         ));
 
         Ok(Arc::new(RegistryService::from_parts(

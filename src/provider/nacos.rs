@@ -7,7 +7,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::RegistryResult;
-use crate::instance::{Endpoint, ServiceInstance};
+#[cfg(feature = "nacos")]
+use crate::instance::Endpoint;
+use crate::instance::ServiceInstance;
 use crate::traits::{EventStream, Registry};
 
 /// Nacos 服务端与连接配置
@@ -188,7 +190,10 @@ impl Registry for NacosRegistry {
             return Ok(());
         }
 
+        #[cfg(feature = "nacos")]
         let instance = self.registered_instance.lock().await.take();
+        #[cfg(not(feature = "nacos"))]
+        let _ = self.registered_instance.lock().await.take();
 
         #[cfg(feature = "nacos")]
         if let Some(inst) = instance {
@@ -287,6 +292,9 @@ impl Registry for NacosRegistry {
                 }
             }
         }
+
+        #[cfg(not(feature = "nacos"))]
+        let _ = service_name;
 
         Ok(Vec::new())
     }

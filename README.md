@@ -18,6 +18,7 @@
 - 🚀 **极速无锁 RCU 快照读取**：基于 `arc-swap` 实现读写无锁分离，日常读操作延迟 `< 5ns`，零 CPU Cacheline 颠簸与协程阻塞。
 - 📡 **事件驱动推送**：基于底层 Watch 前缀事件流长连接，毫秒级感知节点上下线；断线指数退避重连。
 - 🛡️ **生产级自愈保活**：etcd 租约自动续签与自愈重连，双重静默周期校准兜底，彻底杜绝数据漂移与雪崩。
+- 💾 **本地磁盘快照容灾降级（Disaster Recovery）**：支持异步将服务拓扑持久化至磁盘，即使注册中心集群全部宕机或突发断网，服务冷启动与调用仍能从本地磁盘快照无缝降级恢复。
 - ⚡ **RPC / gRPC 原生支持**：
   - **Tower 生态集成**：原生实现 `tower::discover::Discover` 规范，无缝对接各类基于 Tower 的微服务中间件。
   - **Tonic 开箱即用**：提供 `registry.tonic_channel("service")`，自动转换为 Tonic 动态负载均衡连接池（`balance_channel`）。
@@ -25,7 +26,9 @@
   - `etcd`：生产级高可用集群注册中心（基于 `etcd-client`）。
   - `local`：本地直连 Provider，免外部中间件，极速单测与本地开发。
   - `nacos`：主流微服务治理协议接入。
-- ⚖️ **丰富的负载均衡算法**：
+- ⚖️ **丰富的工业级负载均衡算法**：
+  - `P2CSelector`（Power of Two Choices）：结合活跃并发数（Inflight）与权重的最优二选一，有效规避慢节点羊群效应。
+  - `ConsistentHashSelector`：带虚拟节点技术与拓扑指纹缓存的高性能一致性哈希，保障会话粘滞与分片亲和性。
   - `RoundRobinSelector`：基于微服务独立的原子计数器，零锁争用。
   - `WeightedRoundRobinSelector`：Nginx 经典平滑加权算法。
   - `RandomSelector`：高效随机。
@@ -138,6 +141,63 @@ let chosen = registry.select_instance_with_context(&ctx).await?;
 
 ---
 
+## 🎯 一致性哈希分片路由 (Consistent Hashing)
+
+适用于长连接有状态服务、会话粘滞（Sticky Session）及分布式缓存分片：
+
+```rust
+use pecs_registry::prelude::*;
+use std::sync::Arc;
+
+let selector = Arc::new(ConsistentHashSelector::with_virtual_nodes(150));
+let registry = RegistryBuilder::local()
+    .with_selector(selector)
+    .build()?;
+
+// 基于用户 ID 或订单 ID 等 Sharding Key 进行确定性路由
+let ctx = SelectContext::new("chat-service").with_key("user_session_100234");
+let chosen = registry.select_instance_with_context(&ctx).await?;
+```
+
+---
+
+## ⚖️ P2C 动态负载均衡 (Power of Two Choices)
+
+Envoy、Finagle 工业级标准：随机挑两节点，评估活跃在途请求数与节点权重，自动避开慢节点：
+
+```rust
+use pecs_registry::prelude::*;
+use std::sync::Arc;
+
+let p2c = Arc::new(P2CSelector::new());
+let registry = RegistryBuilder::local()
+    .with_selector(p2c.clone())
+    .build()?;
+
+// 配合生命周期 Guard 追踪在途并发（请求结束离开作用域自动归还）
+let instances = registry.get_instances("user-service");
+let ctx = SelectContext::new("user-service");
+if let Some((inst, _guard)) = p2c.select_with_guard(&ctx, &instances) {
+    // 处理 RPC / HTTP 请求...
+}
+```
+
+---
+
+## 🛡️ 本地磁盘快照容灾降级 (Disaster Recovery)
+
+即使注册中心 etcd/Nacos 集群全面瘫痪或网络隔离，微服务在冷启动与运行期仍能无损从本地磁盘快照恢复拓扑：
+
+```rust
+use pecs_registry::prelude::*;
+
+let registry = RegistryBuilder::local()
+    .with_disk_cache_dir("./.registry_cache") // 开启本地磁盘快照持久化
+    .build()?;
+```
+
+---
+
 ## ⚡ gRPC / Tonic 原生动态负载均衡
 
 启用 `features = ["tonic"]` 后，可直接将服务发现与 Tonic 的 `balance_channel` 连接池融合：
@@ -188,10 +248,11 @@ let channel = registry.tonic_channel_with_config("user-service", |endpoint| {
   ┌──────────────────────────────┐ ┌─────────────────────────┐
   │  ServiceDirectory (快照目录)   │ │  Selector (路由负载均衡) │
   ├──────────────────────────────┤ ├─────────────────────────┤
-  │ • < 5ns 纯内存无锁 RCU 快照   │ │ • RoundRobin (原子无锁) │
-  │ • 增量 Watch 长连接自愈监听    │ │ • WeightedRoundRobin    │
-  │ • Tower Discover 增量变更流   │ │ • TagFilter / Canary    │
-  │ • 周期性全量静默对齐兜底       │ │ • Random                │
+  │ • < 5ns 纯内存无锁 RCU 快照   │ │ • P2C (动态负载二选一)   │
+  │ • 增量 Watch 长连接自愈监听    │ │ • ConsistentHash (环分片)│
+  │ • 本地磁盘快照容灾降级恢复     │ │ • RoundRobin (原子无锁) │
+  │ • Tower Discover 增量变更流   │ │ • WeightedRoundRobin    │
+  │ • 周期性全量静默对齐兜底       │ │ • TagFilter / Canary    │
   └───────────────┬──────────────┘ └─────────────────────────┘
                   │
                   ▼

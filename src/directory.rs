@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -16,7 +17,8 @@ use crate::traits::{InstanceListener, Registry, ServiceEvent};
 /// 1. 真正的无锁 RCU 快照读取（< 5ns），完全无任何 Mutex/RwLock 读锁争用；
 /// 2. 节点上下线基于底层 Watch 长流主动毫秒级推送，日常 0 网络请求；
 /// 3. 具备 Watch 断线指数退避重连与全量周期校准自愈兜底机制；
-/// 4. 支持注册变更监听器（`InstanceListener`），便于与连接池、网关路由、Tower/Tonic 联动。
+/// 4. 支持本地磁盘快照容灾降级，在注册中心宕机或网络分区时仍能维持基础服务拓扑；
+/// 5. 支持注册变更监听器（`InstanceListener`），便于与连接池、网关路由、Tower/Tonic 联动。
 #[derive(Clone)]
 pub struct ServiceDirectory {
     registry: Arc<dyn Registry>,
@@ -24,6 +26,7 @@ pub struct ServiceDirectory {
     active_watches: Arc<Mutex<HashMap<String, CancellationToken>>>,
     listeners: Arc<RwLock<Vec<Arc<dyn InstanceListener>>>>,
     reconcile_interval: Duration,
+    disk_cache_dir: Option<PathBuf>,
 }
 
 impl ServiceDirectory {
@@ -32,12 +35,21 @@ impl ServiceDirectory {
     }
 
     pub fn with_reconcile_interval(registry: Arc<dyn Registry>, interval: Duration) -> Self {
+        Self::with_options(registry, interval, None)
+    }
+
+    pub fn with_options(
+        registry: Arc<dyn Registry>,
+        interval: Duration,
+        disk_cache_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             registry,
             snapshots: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             active_watches: Arc::new(Mutex::new(HashMap::new())),
             listeners: Arc::new(RwLock::new(Vec::new())),
             reconcile_interval: interval,
+            disk_cache_dir,
         }
     }
 
@@ -59,6 +71,35 @@ impl ServiceDirectory {
             }
         }
         self.add_listener(Arc::new(FnListener(f)));
+    }
+
+    /// 保存服务实例快照至本地磁盘（异步无阻塞执行，用于灾难恢复）
+    pub fn persist_to_disk(&self, service_name: &str, instances: Arc<Vec<ServiceInstance>>) {
+        if let Some(ref dir) = self.disk_cache_dir {
+            let dir_clone = dir.clone();
+            let svc_name = service_name.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = tokio::fs::create_dir_all(&dir_clone).await {
+                    tracing::warn!("⚠️ 创建本地快照目录 '{dir_clone:?}' 失败: {e}");
+                    return;
+                }
+                let file_path = dir_clone.join(format!("{svc_name}.json"));
+                let tmp_path = dir_clone.join(format!("{svc_name}.tmp.{}", std::process::id()));
+                if let Ok(bytes) = serde_json::to_vec_pretty(&*instances) {
+                    if tokio::fs::write(&tmp_path, bytes).await.is_ok() {
+                        let _ = tokio::fs::rename(tmp_path, file_path).await;
+                    }
+                }
+            });
+        }
+    }
+
+    /// 从本地磁盘尝试读取历史快照
+    pub async fn load_from_disk(&self, service_name: &str) -> Option<Vec<ServiceInstance>> {
+        let dir = self.disk_cache_dir.as_ref()?;
+        let file_path = dir.join(format!("{service_name}.json"));
+        let bytes = tokio::fs::read(&file_path).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// 零锁读取指定服务的当前健康实例快照（真正的无锁 RCU 内存返回，纳秒级无阻塞）
@@ -92,9 +133,25 @@ impl ServiceDirectory {
             }
         }
 
-        // 2. 首次全量拉取对齐
-        let remote_instances = self.registry.list_instances(service_name).await?;
-        let shared_instances = Arc::new(remote_instances);
+        // 2. 首次全量拉取对齐（支持注册中心不可用时的本地磁盘快照容灾降级）
+        let shared_instances = match self.registry.list_instances(service_name).await {
+            Ok(remote_instances) => {
+                let shared = Arc::new(remote_instances);
+                self.persist_to_disk(service_name, shared.clone());
+                shared
+            }
+            Err(err) => {
+                if let Some(recovered) = self.load_from_disk(service_name).await {
+                    tracing::warn!(
+                        "⚠️ 注册中心无法访问 ({err})，已从本地磁盘快照恢复服务 '{service_name}' 的 {} 个历史节点 (容灾降级模式)",
+                        recovered.len()
+                    );
+                    Arc::new(recovered)
+                } else {
+                    return Err(err);
+                }
+            }
+        };
 
         self.snapshots.rcu(|current| {
             let mut next = (**current).clone();
@@ -102,7 +159,7 @@ impl ServiceDirectory {
             next
         });
 
-        // 3. 启动后台长连接 Watch 任务
+        // 3. 启动后台长连接 Watch 任务（如果当前网络不可用，Watch 循环会自动进入指数退避重试，直至注册中心恢复）
         self.ensure_watcher_started(service_name).await;
 
         Ok(shared_instances)
@@ -228,6 +285,9 @@ impl ServiceDirectory {
             next.insert(service_name.to_string(), new_list);
             next
         });
+
+        // 异步更新本地磁盘快照，保证断电与突发宕机容灾
+        self.persist_to_disk(service_name, final_list.clone());
 
         // 触发监听器通知
         let listeners = {
