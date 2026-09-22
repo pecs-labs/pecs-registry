@@ -15,9 +15,13 @@ default = ["local", "etcd"]
 local = []
 etcd = ["dep:etcd-client"]
 nacos = ["dep:reqwest"]
+tower = ["dep:tower"]
+tonic = ["tower", "dep:tonic"]
 
 [dependencies]
+arc-swap = "1.7"
 async-trait = "0.1"
+futures-core = { version = "0.3", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
@@ -31,6 +35,10 @@ etcd-client = { version = "0.19", optional = true }
 
 # Nacos HTTP OpenAPI provider (optional)
 reqwest = { version = "0.12", features = ["json"], optional = true }
+
+# Tower & Tonic Discover integration (optional)
+tower = { version = "0.5", features = ["discover", "util"], optional = true }
+tonic = { version = "0.14", features = ["transport"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "macros"] }

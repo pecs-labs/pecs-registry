@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod config;
 pub mod directory;
+pub mod discover;
 pub mod error;
 pub mod instance;
 pub mod provider;
@@ -10,6 +11,8 @@ pub mod traits;
 pub use builder::RegistryBuilder;
 pub use config::RegistryConfig;
 pub use directory::ServiceDirectory;
+#[cfg(feature = "tower")]
+pub use discover::ServiceDiscover;
 pub use error::{RegistryError, RegistryResult};
 pub use instance::{Endpoint, ServiceInstance};
 pub use provider::*;
@@ -155,6 +158,36 @@ impl RegistryService {
         let chosen = self.selector.select(ctx, &instances);
         Ok(chosen.cloned())
     }
+
+    #[cfg(feature = "tower")]
+    /// 创建针对指定微服务的 Tower Discover 事件流
+    pub async fn discover_stream(&self, service_name: &str) -> RegistryResult<ServiceDiscover> {
+        self.directory.discover_stream(service_name).await
+    }
+
+    #[cfg(feature = "tonic")]
+    /// 创建开箱即用的 Tonic 动态负载均衡 Channel
+    pub async fn tonic_channel(
+        &self,
+        service_name: &str,
+    ) -> RegistryResult<tonic::transport::Channel> {
+        self.directory.tonic_channel(service_name).await
+    }
+
+    #[cfg(feature = "tonic")]
+    /// 创建带自定义配置的 Tonic 动态负载均衡 Channel
+    pub async fn tonic_channel_with_config<F>(
+        &self,
+        service_name: &str,
+        configure: F,
+    ) -> RegistryResult<tonic::transport::Channel>
+    where
+        F: Fn(tonic::transport::Endpoint) -> tonic::transport::Endpoint + Send + Sync + 'static,
+    {
+        self.directory
+            .tonic_channel_with_config(service_name, configure)
+            .await
+    }
 }
 
 /// 常用类型便捷导出
@@ -162,6 +195,8 @@ pub mod prelude {
     pub use crate::builder::RegistryBuilder;
     pub use crate::config::RegistryConfig;
     pub use crate::directory::ServiceDirectory;
+    #[cfg(feature = "tower")]
+    pub use crate::discover::ServiceDiscover;
     pub use crate::error::{RegistryError, RegistryResult};
     pub use crate::instance::{Endpoint, ServiceInstance};
     pub use crate::provider::local::LocalRegistry;

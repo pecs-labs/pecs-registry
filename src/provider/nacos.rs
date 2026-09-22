@@ -21,9 +21,6 @@ pub struct NacosConfig {
     /// 命名空间 ID (Tenant/Namespace)，默认 "public"
     #[serde(default = "default_namespace")]
     pub namespace: String,
-    /// 是否开启动态配置中心
-    #[serde(default = "default_true")]
-    pub enable_config: bool,
     /// 是否开启服务注册与发现 (Naming)
     #[serde(default = "default_true")]
     pub enable_naming: bool,
@@ -34,9 +31,6 @@ pub struct NacosConfig {
     /// 服务实例注册元数据配置
     #[serde(default)]
     pub registration: NacosRegistrationConfig,
-    /// 预加载与监听的远程配置列表
-    #[serde(default)]
-    pub bootstrap: Vec<NacosBootstrapConfig>,
 }
 
 fn default_app_name() -> String {
@@ -91,16 +85,6 @@ impl Default for NacosRegistrationConfig {
             metadata: HashMap::new(),
         }
     }
-}
-
-/// Nacos 配置中心动态加载条目
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NacosBootstrapConfig {
-    pub data_id: String,
-    #[serde(default = "default_group")]
-    pub group: String,
-    #[serde(default = "default_true")]
-    pub dynamic: bool,
 }
 
 /// Nacos 注册中心适配器

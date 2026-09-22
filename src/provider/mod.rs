@@ -5,7 +5,7 @@ pub mod nacos;
 pub mod etcd;
 
 pub use local::LocalRegistry;
-pub use nacos::{NacosBootstrapConfig, NacosConfig, NacosRegistrationConfig, NacosRegistry};
+pub use nacos::{NacosConfig, NacosRegistrationConfig, NacosRegistry};
 
 #[cfg(feature = "etcd")]
 pub use etcd::EtcdRegistry;

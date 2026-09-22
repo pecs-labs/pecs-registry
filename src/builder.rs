@@ -66,7 +66,6 @@ impl RegistryBuilder {
                     server_addr: format!("{}:{}", config.host, config.port),
                     app_name: "pecs-app".to_string(),
                     namespace: config.namespace.clone(),
-                    enable_config: true,
                     enable_naming: config.enable,
                     username: config.user.clone(),
                     password: config.password.clone(),
@@ -78,7 +77,6 @@ impl RegistryBuilder {
                         ephemeral: true,
                         metadata: std::collections::HashMap::new(),
                     },
-                    bootstrap: vec![],
                 };
                 let nacos = Arc::new(crate::provider::nacos::NacosRegistry::new(nacos_cfg));
                 builder.provider = Some(nacos);
