@@ -139,12 +139,12 @@ impl ServiceDirectory {
         let initial_instances = self.load_or_watch(service_name).await?;
 
         // 2. 转换并注入初始存量 gRPC 实例
-        let known_ids = Arc::new(Mutex::new(HashSet::new()));
+        let known_endpoints = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         for inst in initial_instances.iter() {
             if let Some(ref grpc) = inst.grpc {
                 let url = grpc.to_url("http");
-                if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
+                if let Ok(ep) = tonic::transport::Endpoint::from_shared(url.clone()) {
                     let ep = configure(ep);
                     let _ = tx
                         .send(tonic::transport::channel::Change::Insert(
@@ -152,7 +152,7 @@ impl ServiceDirectory {
                             ep,
                         ))
                         .await;
-                    known_ids.lock().unwrap().insert(inst.service_id.clone());
+                    known_endpoints.lock().unwrap().insert(inst.service_id.clone(), url);
                 }
             }
         }
@@ -165,32 +165,50 @@ impl ServiceDirectory {
             if name != svc_name {
                 return;
             }
-            let mut known = known_ids.lock().unwrap();
-            let mut new_set = HashSet::new();
+            let mut known = known_endpoints.lock().unwrap();
+            let mut new_map = std::collections::HashMap::new();
 
             for inst in instances {
                 if let Some(ref grpc) = inst.grpc {
-                    new_set.insert(inst.service_id.clone());
-                    if !known.contains(&inst.service_id) {
-                        let url = grpc.to_url("http");
-                        if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
-                            let ep = configure(ep);
-                            let _ = tx.try_send(tonic::transport::channel::Change::Insert(
-                                inst.service_id.clone(),
-                                ep,
-                            ));
+                    let url = grpc.to_url("http");
+                    new_map.insert(inst.service_id.clone(), url.clone());
+
+                    match known.get(&inst.service_id) {
+                        Some(old_url) if old_url == &url => {
+                            // URL 未发生变化，复用现有活跃连接
+                        }
+                        Some(_) => {
+                            // 节点 IP 或端口变更：先下线旧端点，再挂载新端点
+                            let _ = tx.try_send(tonic::transport::channel::Change::Remove(inst.service_id.clone()));
+                            if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
+                                let ep = configure(ep);
+                                let _ = tx.try_send(tonic::transport::channel::Change::Insert(
+                                    inst.service_id.clone(),
+                                    ep,
+                                ));
+                            }
+                        }
+                        None => {
+                            // 新上线节点
+                            if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
+                                let ep = configure(ep);
+                                let _ = tx.try_send(tonic::transport::channel::Change::Insert(
+                                    inst.service_id.clone(),
+                                    ep,
+                                ));
+                            }
                         }
                     }
                 }
             }
 
-            for old_id in known.iter() {
-                if !new_set.contains(old_id) {
+            for old_id in known.keys() {
+                if !new_map.contains_key(old_id) {
                     let _ = tx.try_send(tonic::transport::channel::Change::Remove(old_id.clone()));
                 }
             }
 
-            *known = new_set;
+            *known = new_map;
         });
 
         Ok(channel)
