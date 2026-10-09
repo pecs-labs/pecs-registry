@@ -48,9 +48,7 @@ impl Selector for WeightedRoundRobinSelector {
             let weight = (inst.weight.max(1.0) * 100.0) as isize;
             total_weight += weight;
 
-            let cur = service_weights
-                .entry(inst.service_id.clone())
-                .or_insert(0);
+            let cur = service_weights.entry(inst.service_id.clone()).or_insert(0);
             *cur += weight;
 
             if *cur > max_current_weight {

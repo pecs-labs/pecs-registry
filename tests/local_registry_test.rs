@@ -47,9 +47,21 @@ async fn test_local_registry_crud_and_directory_watch() {
     assert_eq!(discovered2.len(), 2);
 
     // 5. 负载均衡选择（Round-Robin 轮询）
-    let sel1 = service.select_instance("user-service").await.unwrap().unwrap();
-    let sel2 = service.select_instance("user-service").await.unwrap().unwrap();
-    let sel3 = service.select_instance("user-service").await.unwrap().unwrap();
+    let sel1 = service
+        .select_instance("user-service")
+        .await
+        .unwrap()
+        .unwrap();
+    let sel2 = service
+        .select_instance("user-service")
+        .await
+        .unwrap()
+        .unwrap();
+    let sel3 = service
+        .select_instance("user-service")
+        .await
+        .unwrap()
+        .unwrap();
     assert_ne!(sel1.service_id, sel2.service_id);
     assert_eq!(sel1.service_id, sel3.service_id);
 
@@ -69,7 +81,8 @@ struct TestListener(Arc<std::sync::atomic::AtomicUsize>);
 
 impl InstanceListener for TestListener {
     fn on_change(&self, _service_name: &str, instances: &[ServiceInstance]) {
-        self.0.fetch_add(instances.len(), std::sync::atomic::Ordering::SeqCst);
+        self.0
+            .fetch_add(instances.len(), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -80,7 +93,9 @@ async fn test_instance_listener_notification() {
 
     let notify_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    service.directory().add_listener(Arc::new(TestListener(notify_count.clone())));
+    service
+        .directory()
+        .add_listener(Arc::new(TestListener(notify_count.clone())));
 
     // 预热 watch
     let _ = service.discover("order-service").await.unwrap();

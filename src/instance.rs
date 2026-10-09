@@ -137,11 +137,7 @@ impl ServiceInstance {
     }
 
     /// 极简便捷构造：用于测试或单机快速注册
-    pub fn simple(
-        service_name: impl Into<String>,
-        host: impl Into<String>,
-        port: u16,
-    ) -> Self {
+    pub fn simple(service_name: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
         let name = service_name.into();
         let host_str = host.into();
         let endpoint = Endpoint::new(host_str.clone(), port);

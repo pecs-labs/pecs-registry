@@ -22,13 +22,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. 普通流量请求（命中全局实例）
     let normal_ctx = SelectContext::new("order-service");
-    let normal_target = registry.select_instance_with_context(&normal_ctx).await?.unwrap();
+    let normal_target = registry
+        .select_instance_with_context(&normal_ctx)
+        .await?
+        .unwrap();
     println!("普通流量路由节点: {}", normal_target.service_id);
 
     // 4. 灰度流量请求（带 HTTP Header 或 Query 提取的 tag）
     let canary_ctx = SelectContext::new("order-service").with_tag("version", "v2.0.0");
-    let canary_target = registry.select_instance_with_context(&canary_ctx).await?.unwrap();
-    println!("灰度流量精准命中节点: {} (version={:?})", canary_target.service_id, canary_target.metadata.get("version"));
+    let canary_target = registry
+        .select_instance_with_context(&canary_ctx)
+        .await?
+        .unwrap();
+    println!(
+        "灰度流量精准命中节点: {} (version={:?})",
+        canary_target.service_id,
+        canary_target.metadata.get("version")
+    );
 
     Ok(())
 }

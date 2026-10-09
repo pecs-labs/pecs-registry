@@ -31,7 +31,9 @@ impl Registry for BrokenRegistry {
     }
 
     async fn list_instances(&self, _service_name: &str) -> RegistryResult<Vec<ServiceInstance>> {
-        Err(RegistryError::Connection("cluster completely down".to_string()))
+        Err(RegistryError::Connection(
+            "cluster completely down".to_string(),
+        ))
     }
 
     async fn watch(&self, _service_name: &str) -> RegistryResult<EventStream> {
@@ -68,14 +70,14 @@ async fn test_disk_snapshot_write_and_recovery() {
 
     // 2. 模拟注册中心宕机，新启动的节点在冷启动时从磁盘快照容灾恢复
     let broken = Arc::new(BrokenRegistry);
-    let recovery_directory = ServiceDirectory::with_options(
-        broken,
-        Duration::from_secs(60),
-        Some(temp_dir.clone()),
-    );
+    let recovery_directory =
+        ServiceDirectory::with_options(broken, Duration::from_secs(60), Some(temp_dir.clone()));
 
     // 此时虽然远端 BrokenRegistry 彻底抛出 Connection 错误，但目录能无损降级恢复
-    let recovered = recovery_directory.load_or_watch("payment-svc").await.unwrap();
+    let recovered = recovery_directory
+        .load_or_watch("payment-svc")
+        .await
+        .unwrap();
     assert_eq!(recovered.len(), 2);
     let ids: Vec<&str> = recovered.iter().map(|i| i.service_id.as_str()).collect();
     assert!(ids.contains(&"pay-node-01"));

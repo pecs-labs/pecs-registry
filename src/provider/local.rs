@@ -32,7 +32,10 @@ impl LocalRegistry {
 
     /// 便捷测试/调试方法：向本地注册中心直接添加一个实例
     pub fn add_instance(&self, instance: ServiceInstance) {
-        let mut write = self.instances.write().expect("local registry lock poisoned");
+        let mut write = self
+            .instances
+            .write()
+            .expect("local registry lock poisoned");
         let svc_map = write
             .entry(instance.name.clone())
             .or_insert_with(HashMap::new);
@@ -42,7 +45,10 @@ impl LocalRegistry {
 
     /// 便捷测试/调试方法：直接删除一个实例
     pub fn remove_instance(&self, service_name: &str, service_id: &str) {
-        let mut write = self.instances.write().expect("local registry lock poisoned");
+        let mut write = self
+            .instances
+            .write()
+            .expect("local registry lock poisoned");
         if let Some(svc_map) = write.get_mut(service_name) {
             svc_map.remove(service_id);
         }
@@ -54,7 +60,10 @@ impl LocalRegistry {
 
     /// 清空所有实例
     pub fn clear(&self) {
-        let mut write = self.instances.write().expect("local registry lock poisoned");
+        let mut write = self
+            .instances
+            .write()
+            .expect("local registry lock poisoned");
         write.clear();
     }
 }
@@ -69,17 +78,25 @@ impl Default for LocalRegistry {
 impl Registry for LocalRegistry {
     async fn register(&self, instance: &ServiceInstance) -> RegistryResult<()> {
         {
-            let mut write = self.instances.write().expect("local registry lock poisoned");
+            let mut write = self
+                .instances
+                .write()
+                .expect("local registry lock poisoned");
             let svc_map = write
                 .entry(instance.name.clone())
                 .or_insert_with(HashMap::new);
             svc_map.insert(instance.service_id.clone(), instance.clone());
         }
 
-        *self.registered_key.lock().await = Some((instance.name.clone(), instance.service_id.clone()));
+        *self.registered_key.lock().await =
+            Some((instance.name.clone(), instance.service_id.clone()));
 
         let _ = self.tx.send(ServiceEvent::Upsert(instance.clone()));
-        tracing::info!("✅ [LocalRegistry] 注册实例成功: {}:{}", instance.name, instance.service_id);
+        tracing::info!(
+            "✅ [LocalRegistry] 注册实例成功: {}:{}",
+            instance.name,
+            instance.service_id
+        );
         Ok(())
     }
 
@@ -87,7 +104,10 @@ impl Registry for LocalRegistry {
         let key = self.registered_key.lock().await.take();
         if let Some((svc_name, svc_id)) = key {
             {
-                let mut write = self.instances.write().expect("local registry lock poisoned");
+                let mut write = self
+                    .instances
+                    .write()
+                    .expect("local registry lock poisoned");
                 if let Some(svc_map) = write.get_mut(&svc_name) {
                     svc_map.remove(&svc_id);
                 }

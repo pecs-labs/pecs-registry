@@ -182,7 +182,8 @@ impl ServiceDirectory {
         let svc_name = service_name.to_string();
 
         tokio::spawn(async move {
-            this.run_watch_loop(svc_name, cancel_token, initial_stream).await;
+            this.run_watch_loop(svc_name, cancel_token, initial_stream)
+                .await;
         });
     }
 

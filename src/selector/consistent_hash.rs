@@ -71,7 +71,11 @@ impl ConsistentHashSelector {
     }
 
     /// 获取或构建当前服务的哈希环
-    fn get_or_build_ring(&self, service_name: &str, instances: &[ServiceInstance]) -> Arc<RingCache> {
+    fn get_or_build_ring(
+        &self,
+        service_name: &str,
+        instances: &[ServiceInstance],
+    ) -> Arc<RingCache> {
         let fingerprint = compute_fingerprint(instances);
 
         // 1. 尝试读锁获取有效缓存

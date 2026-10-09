@@ -120,7 +120,8 @@ impl RegistryService {
     /// 向注册中心登记当前服务节点（带自愈保活心跳与即时本地快照感知）
     pub async fn register(&self, instance: &ServiceInstance) -> RegistryResult<()> {
         self.provider.register(instance).await?;
-        self.directory.apply_event(&instance.name, ServiceEvent::Upsert(instance.clone()));
+        self.directory
+            .apply_event(&instance.name, ServiceEvent::Upsert(instance.clone()));
         Ok(())
     }
 

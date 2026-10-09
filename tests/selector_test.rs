@@ -60,10 +60,14 @@ fn test_canary_tag_filter_selector() {
     let canary_selector = TagFilterSelector::new(base_selector);
 
     let mut inst1 = mock_instance("node-v1", 1.0);
-    inst1.metadata.insert("version".to_string(), "v1".to_string());
+    inst1
+        .metadata
+        .insert("version".to_string(), "v1".to_string());
 
     let mut inst2 = mock_instance("node-v2", 1.0);
-    inst2.metadata.insert("version".to_string(), "v2".to_string());
+    inst2
+        .metadata
+        .insert("version".to_string(), "v2".to_string());
 
     let instances = vec![inst1, inst2];
 

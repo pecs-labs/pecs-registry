@@ -19,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. 服务发现与实例选择
     if let Some(target) = registry.select_instance("user-service").await? {
-        println!("🎯 负载均衡选中目标节点: {} ({:?})", target.service_id, target.http);
+        println!(
+            "🎯 负载均衡选中目标节点: {} ({:?})",
+            target.service_id, target.http
+        );
     }
 
     // 4. 优雅下线

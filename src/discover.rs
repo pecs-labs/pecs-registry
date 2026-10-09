@@ -36,10 +36,7 @@ pub struct ServiceDiscover {
 impl futures_core::Stream for ServiceDiscover {
     type Item = Result<tower::discover::Change<String, ServiceInstance>, Infallible>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(change)) => Poll::Ready(Some(Ok(change))),
             Poll::Ready(None) => Poll::Ready(None),
@@ -81,8 +78,7 @@ impl ServiceDirectory {
                 return;
             }
             let mut known = known_ids.lock().unwrap();
-            let new_set: HashSet<String> =
-                instances.iter().map(|i| i.service_id.clone()).collect();
+            let new_set: HashSet<String> = instances.iter().map(|i| i.service_id.clone()).collect();
 
             // 检查被移除的实例
             for old_id in known.iter() {
@@ -152,7 +148,10 @@ impl ServiceDirectory {
                             ep,
                         ))
                         .await;
-                    known_endpoints.lock().unwrap().insert(inst.service_id.clone(), url);
+                    known_endpoints
+                        .lock()
+                        .unwrap()
+                        .insert(inst.service_id.clone(), url);
                 }
             }
         }
@@ -179,7 +178,9 @@ impl ServiceDirectory {
                         }
                         Some(_) => {
                             // 节点 IP 或端口变更：先下线旧端点，再挂载新端点
-                            let _ = tx.try_send(tonic::transport::channel::Change::Remove(inst.service_id.clone()));
+                            let _ = tx.try_send(tonic::transport::channel::Change::Remove(
+                                inst.service_id.clone(),
+                            ));
                             if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
                                 let ep = configure(ep);
                                 let _ = tx.try_send(tonic::transport::channel::Change::Insert(

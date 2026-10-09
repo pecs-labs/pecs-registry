@@ -143,7 +143,10 @@ impl Registry for NacosRegistry {
                 ("ip", ip.as_str()),
                 ("groupName", self.config.registration.group.as_str()),
                 ("namespaceId", self.config.namespace.as_str()),
-                ("clusterName", self.config.registration.cluster_name.as_str()),
+                (
+                    "clusterName",
+                    self.config.registration.cluster_name.as_str(),
+                ),
             ];
             let port_str = port.to_string();
             params.push(("port", port_str.as_str()));
@@ -160,10 +163,7 @@ impl Registry for NacosRegistry {
                             instance.name
                         );
                     } else {
-                        tracing::warn!(
-                            "⚠️ 向 Nacos 注册返回非成功状态: {}",
-                            resp.status()
-                        );
+                        tracing::warn!("⚠️ 向 Nacos 注册返回非成功状态: {}", resp.status());
                     }
                 }
                 Err(err) => {

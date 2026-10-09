@@ -65,7 +65,9 @@ impl EtcdRegistry {
         let client = tokio::time::timeout(self.op_timeout(), connect_fut)
             .await
             .map_err(|_| RegistryError::timeout(format!("连接 etcd 集群 ({endpoints:?}) 超时")))?
-            .map_err(|err| RegistryError::connection(format!("连接 etcd ({endpoints:?}) 失败: {err}")))?;
+            .map_err(|err| {
+                RegistryError::connection(format!("连接 etcd ({endpoints:?}) 失败: {err}"))
+            })?;
 
         *guard = Some(client.clone());
         Ok(client)
@@ -113,8 +115,8 @@ impl EtcdRegistry {
 
         let lease_id = lease.id();
         let key = self.make_instance_key(&instance.name, &instance.service_id);
-        let val = serde_json::to_string(instance)
-            .map_err(|err| RegistryError::Serialization(err))?;
+        let val =
+            serde_json::to_string(instance).map_err(|err| RegistryError::Serialization(err))?;
 
         // 2. 写入键值并绑定租约（带操作超时）
         let put_opts = PutOptions::new().with_lease(lease_id);
@@ -201,30 +203,35 @@ impl Registry for EtcdRegistry {
                     );
                     is_first_registration = false;
                 } else {
-                    tracing::info!("🔄 etcd 租约自愈重连成功，重新注册实例: key={key} (lease: {lease_id})");
+                    tracing::info!(
+                        "🔄 etcd 租约自愈重连成功，重新注册实例: key={key} (lease: {lease_id})"
+                    );
                 }
 
                 // 3. 建立心跳保活流（带超时保护）
                 let keep_alive_fut = client.lease_keep_alive(lease_id);
-                let (mut keeper, mut stream) = match tokio::time::timeout(this.op_timeout(), keep_alive_fut).await {
-                    Ok(Ok(pair)) => pair,
-                    Ok(Err(err)) => {
-                        tracing::warn!("⚠️ 建立 etcd lease_keep_alive 失败: {err}，2秒后尝试重新建连");
-                        this.invalidate_client().await;
-                        tokio::select! {
-                            _ = token.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                let (mut keeper, mut stream) =
+                    match tokio::time::timeout(this.op_timeout(), keep_alive_fut).await {
+                        Ok(Ok(pair)) => pair,
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                "⚠️ 建立 etcd lease_keep_alive 失败: {err}，2秒后尝试重新建连"
+                            );
+                            this.invalidate_client().await;
+                            tokio::select! {
+                                _ = token.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                            }
                         }
-                    }
-                    Err(_) => {
-                        tracing::warn!("⚠️ 建立 etcd lease_keep_alive 超时，2秒后尝试重新建连");
-                        this.invalidate_client().await;
-                        tokio::select! {
-                            _ = token.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                        Err(_) => {
+                            tracing::warn!("⚠️ 建立 etcd lease_keep_alive 超时，2秒后尝试重新建连");
+                            this.invalidate_client().await;
+                            tokio::select! {
+                                _ = token.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                            }
                         }
-                    }
-                };
+                    };
 
                 // 4. 心跳保活与异常监听循环
                 let mut connection_healthy = true;
@@ -340,8 +347,12 @@ impl Registry for EtcdRegistry {
         let watch_fut = client.watch(prefix.as_str(), Some(opts));
         let mut stream = tokio::time::timeout(self.op_timeout(), watch_fut)
             .await
-            .map_err(|_| RegistryError::timeout(format!("建立 etcd watch ('{service_name}') 超时")))?
-            .map_err(|e| RegistryError::driver(format!("建立 etcd watch ('{service_name}') 失败: {e}")))?;
+            .map_err(|_| {
+                RegistryError::timeout(format!("建立 etcd watch ('{service_name}') 超时"))
+            })?
+            .map_err(|e| {
+                RegistryError::driver(format!("建立 etcd watch ('{service_name}') 失败: {e}"))
+            })?;
 
         let svc_name = service_name.to_string();
 
@@ -354,7 +365,9 @@ impl Registry for EtcdRegistry {
                                 EventType::Put => {
                                     if let Some(kv) = event.kv() {
                                         if let Ok(val_str) = kv.value_str() {
-                                            if let Ok(inst) = serde_json::from_str::<ServiceInstance>(val_str) {
+                                            if let Ok(inst) =
+                                                serde_json::from_str::<ServiceInstance>(val_str)
+                                            {
                                                 let _ = tx.send(ServiceEvent::Upsert(inst)).await;
                                             }
                                         }
