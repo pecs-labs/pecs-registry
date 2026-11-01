@@ -85,3 +85,36 @@ async fn test_tonic_channel_dynamic_balance() {
     // 验证通道有效可用（底层由 Tonic 动态维护）
     let _ = channel;
 }
+
+#[tokio::test]
+async fn discover_survives_backpressure_and_large_initial_snapshot() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let registry = Arc::new(LocalRegistry::new());
+        let directory = ServiceDirectory::new(registry.clone());
+        for port in 10000..10100 {
+            registry.add_instance(ServiceInstance::simple("large", "127.0.0.1", port));
+        }
+        let mut stream = directory.discover_stream("large").await.unwrap();
+        // More than channel capacity; construction must not wait for a consumer.
+        for _ in 0..100 {
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(Change::Insert(_, _)))
+            ));
+        }
+        // Deliberately stop consuming while more than channel capacity changes arrive.
+        for port in 10100..10300 {
+            let instance = ServiceInstance::simple("large", "127.0.0.1", port);
+            directory.apply_event("large", ServiceEvent::Upsert(instance));
+        }
+        let mut ids = std::collections::HashSet::new();
+        while ids.len() < 200 {
+            if let Some(Ok(Change::Insert(id, _))) = stream.next().await {
+                ids.insert(id);
+            }
+        }
+        assert_eq!(ids.len(), 200);
+    })
+    .await
+    .unwrap();
+}

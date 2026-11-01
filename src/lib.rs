@@ -4,6 +4,8 @@ pub mod directory;
 pub mod discover;
 pub mod error;
 pub mod instance;
+#[cfg(feature = "etcd")]
+pub mod lock;
 pub mod provider;
 pub mod selector;
 pub mod traits;
@@ -117,7 +119,12 @@ impl RegistryService {
         self.provider.clone()
     }
 
-    /// 向注册中心登记当前服务节点（带自愈保活心跳与即时本地快照感知）
+    /// Whether local registration is confirmed and remains leased.
+    pub fn is_registered(&self) -> bool {
+        self.provider.is_registered()
+    }
+
+    /// Register the local instance after the provider confirms its write.
     pub async fn register(&self, instance: &ServiceInstance) -> RegistryResult<()> {
         self.provider.register(instance).await?;
         self.directory

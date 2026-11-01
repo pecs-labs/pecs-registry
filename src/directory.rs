@@ -21,6 +21,8 @@ use crate::traits::{InstanceListener, Registry, ServiceEvent};
 /// 5. 支持注册变更监听器（`InstanceListener`），便于与连接池、网关路由、Tower/Tonic 联动。
 #[derive(Clone)]
 pub struct ServiceDirectory {
+    initialization: Arc<Mutex<()>>,
+    updates: tokio::sync::watch::Sender<u64>,
     registry: Arc<dyn Registry>,
     snapshots: Arc<ArcSwap<HashMap<String, Arc<Vec<ServiceInstance>>>>>,
     active_watches: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -44,6 +46,8 @@ impl ServiceDirectory {
         disk_cache_dir: Option<PathBuf>,
     ) -> Self {
         Self {
+            initialization: Default::default(),
+            updates: tokio::sync::watch::channel(0).0,
             registry,
             snapshots: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             active_watches: Arc::new(Mutex::new(HashMap::new())),
@@ -51,6 +55,11 @@ impl ServiceDirectory {
             reconcile_interval: interval,
             disk_cache_dir,
         }
+    }
+
+    #[cfg(feature = "tower")]
+    pub(crate) fn subscribe_updates(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.updates.subscribe()
     }
 
     /// 添加服务变更监听器
@@ -133,6 +142,11 @@ impl ServiceDirectory {
             }
         }
 
+        // Serialize cold loads so a delayed list cannot overwrite newer watch events.
+        let _initialization = self.initialization.lock().await;
+        if self.active_watches.lock().await.contains_key(service_name) {
+            return Ok(self.get_instances(service_name));
+        }
         // 2. 首次全量拉取对齐（支持注册中心不可用时的本地磁盘快照容灾降级）
         let shared_instances = match self.registry.list_instances(service_name).await {
             Ok(remote_instances) => {
@@ -228,6 +242,9 @@ impl ServiceDirectory {
                         return;
                     }
                     _ = reconcile_interval.tick() => {
+                        // Revision-aware providers resnapshot through the stream, avoiding stale
+                        // queued events overwriting a newer out-of-band list result.
+                        if self.registry.watch_includes_snapshot() { break; }
                         // 全量静默校准，防止网络抖动丢包
                         if let Ok(latest) = self.registry.list_instances(&service_name).await {
                             self.apply_event(&service_name, ServiceEvent::Reset(latest));
@@ -286,6 +303,9 @@ impl ServiceDirectory {
             next.insert(service_name.to_string(), new_list);
             next
         });
+
+        self.updates
+            .send_modify(|version| *version = version.wrapping_add(1));
 
         // 异步更新本地磁盘快照，保证断电与突发宕机容灾
         self.persist_to_disk(service_name, final_list.clone());

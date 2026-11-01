@@ -272,3 +272,23 @@ Licensed under either of:
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
+
+
+## Distributed coordination
+
+`pecs_registry::lock::{LockService, LockConfig, LockGuard}` provides etcd lease-backed
+locks independently of the `Registry` trait. Each acquisition uses a separate lease;
+`release().await` confirms revocation, Drop cancels renewal and schedules cleanup.
+The guard exposes `lost()`, `is_lost()` and a fencing token from the ownership key's
+creation revision. Downstream storage must enforce fencing or idempotent conditional
+writes; leases alone do not protect against a paused former owner.
+
+Real-etcd regression tests (use an isolated instance):
+
+```sh
+ETCD_TEST_ENDPOINT=http://127.0.0.1:12379 cargo test -p pecs-registry --all-features --test etcd_coordination_test -- --ignored
+```
+
+Connection configuration accepts single URLs, comma-separated endpoints and optional
+`tls` PEM credentials (`domain_name`, `ca_pem`, `client_cert_pem`, `client_key_pem`).
+Registration now awaits the first confirmed write and returns errors to callers.

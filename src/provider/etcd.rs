@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use etcd_client::{Client, ConnectOptions, EventType, GetOptions, PutOptions, WatchOptions};
+use etcd_client::{Client, EventType, GetOptions, PutOptions, WatchOptions};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -14,21 +14,27 @@ use crate::traits::{EventStream, Registry, ServiceEvent};
 /// 基于 etcd-client 的微服务注册中心实现（支持租约心跳自愈与动态事件流 Watch）
 #[derive(Clone)]
 pub struct EtcdRegistry {
+    ready: Arc<std::sync::atomic::AtomicBool>,
     config: RegistryConfig,
     client: Arc<Mutex<Option<Client>>>,
     registered_key: Arc<Mutex<Option<String>>>,
     lease_id: Arc<Mutex<Option<i64>>>,
     cancel_token: Arc<Mutex<Option<CancellationToken>>>,
+    lifecycle: Arc<Mutex<()>>,
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl EtcdRegistry {
     pub fn new(config: RegistryConfig) -> Self {
         Self {
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
             client: Arc::new(Mutex::new(None)),
             registered_key: Arc::new(Mutex::new(None)),
             lease_id: Arc::new(Mutex::new(None)),
             cancel_token: Arc::new(Mutex::new(None)),
+            lifecycle: Arc::new(Mutex::new(())),
+            task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -50,24 +56,7 @@ impl EtcdRegistry {
             return Ok(client.clone());
         }
 
-        let endpoints = self.config.endpoints();
-        let endpoint_strs: Vec<&str> = endpoints.iter().map(|s| s.as_str()).collect();
-
-        let mut options = ConnectOptions::new().with_timeout(self.op_timeout());
-
-        if let (Some(u), Some(p)) = (&self.config.user, &self.config.password) {
-            if !u.is_empty() {
-                options = options.with_user(u, p);
-            }
-        }
-
-        let connect_fut = Client::connect(&endpoint_strs[..], Some(options));
-        let client = tokio::time::timeout(self.op_timeout(), connect_fut)
-            .await
-            .map_err(|_| RegistryError::timeout(format!("连接 etcd 集群 ({endpoints:?}) 超时")))?
-            .map_err(|err| {
-                RegistryError::connection(format!("连接 etcd ({endpoints:?}) 失败: {err}"))
-            })?;
+        let client = crate::config::connect_etcd(&self.config).await?;
 
         *guard = Some(client.clone());
         Ok(client)
@@ -121,11 +110,16 @@ impl EtcdRegistry {
         // 2. 写入键值并绑定租约（带操作超时）
         let put_opts = PutOptions::new().with_lease(lease_id);
         let put_fut = client.put(key.as_str(), val, Some(put_opts));
-        tokio::time::timeout(self.op_timeout(), put_fut)
+        let written = tokio::time::timeout(self.op_timeout(), put_fut)
             .await
-            .map_err(|_| RegistryError::timeout("etcd put 注册键超时"))?
-            .map_err(|err| RegistryError::driver(format!("向 etcd 写入注册键失败: {err}")))?;
+            .map_err(|_| RegistryError::timeout("etcd registration put timeout"))
+            .and_then(|result| result.map_err(|error| RegistryError::driver(error.to_string())));
+        if let Err(error) = written {
+            let _ = tokio::time::timeout(self.op_timeout(), client.lease_revoke(lease_id)).await;
+            return Err(error);
+        }
 
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
         *self.registered_key.lock().await = Some(key.clone());
         *self.lease_id.lock().await = Some(lease_id);
 
@@ -135,6 +129,13 @@ impl EtcdRegistry {
 
 #[async_trait]
 impl Registry for EtcdRegistry {
+    fn is_registered(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn watch_includes_snapshot(&self) -> bool {
+        true
+    }
+
     /// 向 etcd 注册当前服务实例，带租约心跳续期与断线自动重试/重新注册
     async fn register(&self, instance: &ServiceInstance) -> RegistryResult<()> {
         if !self.config.enable || self.config.host.trim().is_empty() {
@@ -142,11 +143,28 @@ impl Registry for EtcdRegistry {
             return Ok(());
         }
 
+        let _lifecycle = self.lifecycle.lock().await;
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
         // 取消上一轮心跳任务（若存在）
         if let Some(token) = self.cancel_token.lock().await.take() {
             token.cancel();
         }
 
+        if let Some(task) = self.task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        // 首次注册必须得到服务端确认，调用失败由启动方决定如何处理。
+        let initial = async {
+            let mut client = self.get_or_connect_client().await?;
+            self.do_register_once(&mut client, instance).await
+        }
+        .await;
+        let (initial, initial_error) = match initial {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(error)),
+        };
         let cancel_token = CancellationToken::new();
         *self.cancel_token.lock().await = Some(cancel_token.clone());
 
@@ -162,7 +180,8 @@ impl Registry for EtcdRegistry {
         let token = cancel_token.clone();
 
         // 启动后台自愈式心跳与重连注册任务
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            let mut first = initial;
             let mut is_first_registration = true;
 
             loop {
@@ -184,7 +203,11 @@ impl Registry for EtcdRegistry {
                 };
 
                 // 2. 申请租约并注册实例元数据
-                let (lease_id, key) = match this.do_register_once(&mut client, &inst).await {
+                let (lease_id, key) = match if let Some(initial) = first.take() {
+                    Ok(initial)
+                } else {
+                    this.do_register_once(&mut client, &inst).await
+                } {
                     Ok(res) => res,
                     Err(err) => {
                         tracing::warn!("⚠️ 向 etcd 写入注册键失败，3秒后重试: {err}");
@@ -217,6 +240,8 @@ impl Registry for EtcdRegistry {
                             tracing::warn!(
                                 "⚠️ 建立 etcd lease_keep_alive 失败: {err}，2秒后尝试重新建连"
                             );
+                            this.ready
+                                .store(false, std::sync::atomic::Ordering::Release);
                             this.invalidate_client().await;
                             tokio::select! {
                                 _ = token.cancelled() => break,
@@ -225,6 +250,8 @@ impl Registry for EtcdRegistry {
                         }
                         Err(_) => {
                             tracing::warn!("⚠️ 建立 etcd lease_keep_alive 超时，2秒后尝试重新建连");
+                            this.ready
+                                .store(false, std::sync::atomic::Ordering::Release);
                             this.invalidate_client().await;
                             tokio::select! {
                                 _ = token.cancelled() => break,
@@ -234,6 +261,8 @@ impl Registry for EtcdRegistry {
                     };
 
                 // 4. 心跳保活与异常监听循环
+                let mut heartbeat = tokio::time::interval(heartbeat_interval);
+                let mut last_ack = tokio::time::Instant::now();
                 let mut connection_healthy = true;
                 while connection_healthy {
                     tokio::select! {
@@ -241,16 +270,20 @@ impl Registry for EtcdRegistry {
                             tracing::info!("收到注销信号，停止 etcd 租约心跳保活 (lease: {lease_id})");
                             return;
                         }
-                        _ = tokio::time::sleep(heartbeat_interval) => {
-                            if let Err(err) = keeper.keep_alive().await {
-                                tracing::warn!("⚠️ etcd 发送心跳失败: {err}");
+                        _ = heartbeat.tick() => {
+                            if !matches!(tokio::time::timeout(this.op_timeout(), keeper.keep_alive()).await, Ok(Ok(()))) {
                                 connection_healthy = false;
                             }
                         }
+                        _ = tokio::time::sleep_until(last_ack + Duration::from_secs(ttl as u64)) => {
+                            connection_healthy = false;
+                        }
                         msg = stream.message() => {
                             match msg {
-                                Ok(Some(_)) => {
-                                    // 租约续签正常
+                                Ok(Some(reply)) => {
+                                    if reply.ttl() <= 0 || reply.id() != lease_id {
+                                        connection_healthy = false;
+                                    } else { last_ack = tokio::time::Instant::now(); }
                                 }
                                 Ok(None) => {
                                     tracing::warn!("⚠️ etcd 心跳流断开，触发重新注册与租约自愈机制");
@@ -266,6 +299,8 @@ impl Registry for EtcdRegistry {
                 }
 
                 // 心跳中断，清空旧 client 缓存并在短暂退避后重新注册
+                this.ready
+                    .store(false, std::sync::atomic::Ordering::Release);
                 this.invalidate_client().await;
                 tokio::select! {
                     _ = token.cancelled() => break,
@@ -273,35 +308,36 @@ impl Registry for EtcdRegistry {
                 }
             }
         });
+        *self.task.lock().await = Some(task);
 
-        Ok(())
+        // Preserve background recovery even when the caller sees an initial failure.
+        match initial_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// 从 etcd 注销服务实例并释放租约（带操作超时保护）
     async fn deregister(&self) -> RegistryResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
         if let Some(token) = self.cancel_token.lock().await.take() {
             token.cancel();
         }
-
-        let key = self.registered_key.lock().await.take();
-        let lease_id = self.lease_id.lock().await.take();
-
-        if let Ok(mut client) = self.get_or_connect_client().await {
-            if let Some(k) = key {
-                let del_fut = client.delete(k.as_str(), None);
-                let _ = tokio::time::timeout(self.op_timeout(), del_fut).await;
-                tracing::info!(
-                    "👋 已从 etcd ({:?}) 注销实例节点: key={k}",
-                    self.config.endpoints()
-                );
-            }
-            if let Some(id) = lease_id {
-                let revoke_fut = client.lease_revoke(id);
-                let _ = tokio::time::timeout(self.op_timeout(), revoke_fut).await;
-                tracing::info!("🗑️ 已撤销 etcd 租约: {id}");
-            }
+        if let Some(task) = self.task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
         }
-
+        let lease = self.lease_id.lock().await.take();
+        self.registered_key.lock().await.take();
+        if let Some(id) = lease {
+            let mut client = self.get_or_connect_client().await?;
+            tokio::time::timeout(self.op_timeout(), client.lease_revoke(id))
+                .await
+                .map_err(|_| RegistryError::timeout("撤销注册租约超时"))?
+                .map_err(|e| RegistryError::driver(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -342,7 +378,25 @@ impl Registry for EtcdRegistry {
 
         let mut client = self.get_or_connect_client().await?;
         let prefix = self.make_service_prefix(service_name);
-        let opts = WatchOptions::new().with_prefix();
+        let snapshot = tokio::time::timeout(
+            self.op_timeout(),
+            client.get(prefix.as_str(), Some(GetOptions::new().with_prefix())),
+        )
+        .await
+        .map_err(|_| RegistryError::timeout("watch snapshot 超时"))?
+        .map_err(|e| RegistryError::driver(e.to_string()))?;
+        let revision = snapshot
+            .header()
+            .ok_or_else(|| RegistryError::driver("missing revision"))?
+            .revision();
+        let instances = snapshot
+            .kvs()
+            .iter()
+            .filter_map(|kv| serde_json::from_slice(kv.value()).ok())
+            .collect();
+        let opts = WatchOptions::new()
+            .with_prefix()
+            .with_start_revision(revision + 1);
 
         let watch_fut = client.watch(prefix.as_str(), Some(opts));
         let mut stream = tokio::time::timeout(self.op_timeout(), watch_fut)
@@ -357,9 +411,19 @@ impl Registry for EtcdRegistry {
         let svc_name = service_name.to_string();
 
         tokio::spawn(async move {
+            if tx.send(ServiceEvent::Reset(instances)).await.is_err() {
+                return;
+            }
             loop {
-                match stream.message().await {
+                let message = tokio::select! {
+                    _ = tx.closed() => break,
+                    result = stream.message() => result,
+                };
+                match message {
                     Ok(Some(resp)) => {
+                        if resp.canceled() || resp.compact_revision() > 0 {
+                            break;
+                        }
                         for event in resp.events() {
                             match event.event_type() {
                                 EventType::Put => {

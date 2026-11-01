@@ -31,7 +31,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 
 # Etcd provider (optional)
-etcd-client = { version = "0.19", optional = true }
+etcd-client = { version = "0.19", optional = true, features = ["tls-roots"] }
 
 # Nacos HTTP OpenAPI provider (optional)
 reqwest = { version = "0.12", features = ["json"], optional = true }
@@ -41,5 +41,5 @@ tower = { version = "0.5", features = ["discover", "util"], optional = true }
 tonic = { version = "0.14", features = ["transport"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["full", "macros"] }
+tokio = { version = "1.0", features = ["full", "macros", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

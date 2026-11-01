@@ -1,28 +1,18 @@
+#![cfg(feature = "tower")]
 //! Tower & Tonic 服务发现抽象集成模块
 //!
 //! 提供：
 //! - `ServiceDiscover`：实现 `futures_core::Stream`，由 Tower 自动适配为 `tower::discover::Discover`，与 Tower 负载均衡生态无缝集成；
 //! - 与 `tonic::transport::Channel::balance_channel` 深度集成，实现开箱即用的 gRPC 客户端动态服务发现与自愈连接池。
 
-#[cfg(feature = "tower")]
-use std::collections::HashSet;
-#[cfg(feature = "tower")]
-use std::convert::Infallible;
-#[cfg(feature = "tower")]
-use std::pin::Pin;
-#[cfg(feature = "tower")]
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "tower")]
-use std::task::{Context, Poll};
-#[cfg(feature = "tower")]
-use tokio::sync::mpsc::Receiver;
-
-#[cfg(feature = "tower")]
 use crate::directory::ServiceDirectory;
-#[cfg(feature = "tower")]
 use crate::error::RegistryResult;
-#[cfg(feature = "tower")]
 use crate::instance::ServiceInstance;
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc::Receiver;
+use tokio_stream::StreamExt;
 
 /// 实现 `futures_core::Stream` 的服务发现事件流
 ///
@@ -50,54 +40,44 @@ impl ServiceDirectory {
     /// 创建针对指定微服务的 Tower Discover 事件流
     pub async fn discover_stream(&self, service_name: &str) -> RegistryResult<ServiceDiscover> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-
-        // 1. 确保已拉取初始快照并激活 Watch
-        let initial_instances = self.load_or_watch(service_name).await?;
-
-        // 2. 发送初始存量实例的 Insert 事件
-        for inst in initial_instances.iter() {
-            let _ = tx
-                .send(tower::discover::Change::Insert(
-                    inst.service_id.clone(),
-                    inst.clone(),
-                ))
-                .await;
-        }
-
-        // 3. 注册监听器监听后续增量事件
-        let svc_name = service_name.to_string();
-        let known_ids = Arc::new(Mutex::new(
-            initial_instances
-                .iter()
-                .map(|i| i.service_id.clone())
-                .collect::<HashSet<_>>(),
-        ));
-
-        self.on_change(move |name, instances| {
-            if name != svc_name {
-                return;
-            }
-            let mut known = known_ids.lock().unwrap();
-            let new_set: HashSet<String> = instances.iter().map(|i| i.service_id.clone()).collect();
-
-            // 检查被移除的实例
-            for old_id in known.iter() {
-                if !new_set.contains(old_id) {
-                    let _ = tx.try_send(tower::discover::Change::Remove(old_id.clone()));
+        // Subscribe before loading: changes during initialization are retained.
+        let mut updates = self.subscribe_updates();
+        self.load_or_watch(service_name).await?;
+        let directory = self.clone();
+        let name = service_name.to_owned();
+        tokio::spawn(async move {
+            let mut known = std::collections::HashMap::<String, ServiceInstance>::new();
+            loop {
+                let current = directory.get_instances(&name);
+                let next: std::collections::HashMap<_, _> = current
+                    .iter()
+                    .map(|i| (i.service_id.clone(), i.clone()))
+                    .collect();
+                let mut changes = Vec::new();
+                for id in known.keys() {
+                    if !next.contains_key(id) {
+                        changes.push(tower::discover::Change::Remove(id.clone()));
+                    }
+                }
+                for (id, instance) in &next {
+                    if known.get(id) != Some(instance) {
+                        changes.push(tower::discover::Change::Insert(
+                            id.clone(),
+                            instance.clone(),
+                        ));
+                    }
+                }
+                for change in changes {
+                    if tx.send(change).await.is_err() {
+                        return;
+                    }
+                }
+                known = next;
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    result = updates.changed() => if result.is_err() { return; },
                 }
             }
-
-            // 检查新增的实例
-            for inst in instances {
-                if !known.contains(&inst.service_id) {
-                    let _ = tx.try_send(tower::discover::Change::Insert(
-                        inst.service_id.clone(),
-                        inst.clone(),
-                    ));
-                }
-            }
-
-            *known = new_set;
         });
 
         Ok(ServiceDiscover { rx })
@@ -130,88 +110,32 @@ impl ServiceDirectory {
         F: Fn(tonic::transport::Endpoint) -> tonic::transport::Endpoint + Send + Sync + 'static,
     {
         let (channel, tx) = tonic::transport::Channel::balance_channel(64);
-
-        // 1. 确保已拉取初始快照并激活 Watch
-        let initial_instances = self.load_or_watch(service_name).await?;
-
-        // 2. 转换并注入初始存量 gRPC 实例
-        let known_endpoints = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-        for inst in initial_instances.iter() {
-            if let Some(ref grpc) = inst.grpc {
-                let url = grpc.to_url("http");
-                if let Ok(ep) = tonic::transport::Endpoint::from_shared(url.clone()) {
-                    let ep = configure(ep);
-                    let _ = tx
-                        .send(tonic::transport::channel::Change::Insert(
-                            inst.service_id.clone(),
-                            ep,
-                        ))
-                        .await;
-                    known_endpoints
-                        .lock()
-                        .unwrap()
-                        .insert(inst.service_id.clone(), url);
-                }
-            }
-        }
-
-        // 3. 注册监听器动态联动后续变更
-        let svc_name = service_name.to_string();
-        let configure = Arc::new(configure);
-
-        self.on_change(move |name, instances| {
-            if name != svc_name {
-                return;
-            }
-            let mut known = known_endpoints.lock().unwrap();
-            let mut new_map = std::collections::HashMap::new();
-
-            for inst in instances {
-                if let Some(ref grpc) = inst.grpc {
-                    let url = grpc.to_url("http");
-                    new_map.insert(inst.service_id.clone(), url.clone());
-
-                    match known.get(&inst.service_id) {
-                        Some(old_url) if old_url == &url => {
-                            // URL 未发生变化，复用现有活跃连接
-                        }
-                        Some(_) => {
-                            // 节点 IP 或端口变更：先下线旧端点，再挂载新端点
-                            let _ = tx.try_send(tonic::transport::channel::Change::Remove(
-                                inst.service_id.clone(),
-                            ));
-                            if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
-                                let ep = configure(ep);
-                                let _ = tx.try_send(tonic::transport::channel::Change::Insert(
-                                    inst.service_id.clone(),
-                                    ep,
-                                ));
+        let mut stream = self.discover_stream(service_name).await?;
+        tokio::spawn(async move {
+            while let Some(Ok(change)) = tokio::select! {
+                _ = tx.closed() => return,
+                change = stream.next() => change,
+            } {
+                let change = match change {
+                    tower::discover::Change::Remove(id) => {
+                        tonic::transport::channel::Change::Remove(id)
+                    }
+                    tower::discover::Change::Insert(id, instance) => {
+                        match instance.grpc.and_then(|grpc| {
+                            tonic::transport::Endpoint::from_shared(grpc.to_url("http")).ok()
+                        }) {
+                            Some(endpoint) => {
+                                tonic::transport::channel::Change::Insert(id, configure(endpoint))
                             }
-                        }
-                        None => {
-                            // 新上线节点
-                            if let Ok(ep) = tonic::transport::Endpoint::from_shared(url) {
-                                let ep = configure(ep);
-                                let _ = tx.try_send(tonic::transport::channel::Change::Insert(
-                                    inst.service_id.clone(),
-                                    ep,
-                                ));
-                            }
+                            None => tonic::transport::channel::Change::Remove(id),
                         }
                     }
+                };
+                if tx.send(change).await.is_err() {
+                    return;
                 }
             }
-
-            for old_id in known.keys() {
-                if !new_map.contains_key(old_id) {
-                    let _ = tx.try_send(tonic::transport::channel::Change::Remove(old_id.clone()));
-                }
-            }
-
-            *known = new_map;
         });
-
         Ok(channel)
     }
 }

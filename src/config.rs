@@ -23,6 +23,8 @@ pub struct RegistryConfig {
     #[serde(default = "default_group")]
     pub group: String,
 
+    #[serde(default)]
+    pub tls: Option<EtcdTlsConfig>,
     pub user: Option<String>,
     pub password: Option<String>,
 
@@ -93,6 +95,7 @@ impl Default for RegistryConfig {
             port: default_port(),
             namespace: default_namespace(),
             group: default_group(),
+            tls: None,
             user: None,
             password: None,
             timeout: default_timeout(),
@@ -107,29 +110,75 @@ impl Default for RegistryConfig {
 impl RegistryConfig {
     /// 获取单点地址 URL
     pub fn endpoint(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        self.endpoints().into_iter().next().unwrap_or_default()
     }
 
     /// 解析并返回注册中心集群终端地址列表
     /// 支持逗号分隔的集群配置（如 host: "10.0.0.1:2379,10.0.0.2:2379"）或单节点 host + port
     pub fn endpoints(&self) -> Vec<String> {
-        if self.host.contains(',') {
-            self.host
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|addr| {
-                    if addr.starts_with("http://") || addr.starts_with("https://") {
-                        addr.to_string()
-                    } else if addr.contains(':') {
-                        format!("http://{addr}")
-                    } else {
-                        format!("http://{addr}:{}", self.port)
-                    }
-                })
-                .collect()
-        } else {
-            vec![self.endpoint()]
-        }
+        self.host
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|addr| {
+                if addr.starts_with("http://") || addr.starts_with("https://") {
+                    addr.to_string()
+                } else if addr.starts_with('[') && addr.ends_with(']') {
+                    format!("http://{addr}:{}", self.port)
+                } else if addr.contains(':') {
+                    format!("http://{addr}")
+                } else {
+                    format!("http://{addr}:{}", self.port)
+                }
+            })
+            .collect()
     }
+}
+
+#[cfg(feature = "etcd")]
+pub(crate) async fn connect_etcd(
+    config: &RegistryConfig,
+) -> crate::RegistryResult<etcd_client::Client> {
+    let timeout = std::time::Duration::from_secs(config.timeout.max(1));
+    let mut options = etcd_client::ConnectOptions::new().with_connect_timeout(timeout);
+    if let Some(tls) = &config.tls {
+        let mut options_tls = etcd_client::TlsOptions::new().with_native_roots();
+        if let Some(domain) = &tls.domain_name {
+            options_tls = options_tls.domain_name(domain);
+        }
+        if let Some(ca) = &tls.ca_pem {
+            options_tls = options_tls.ca_certificate(etcd_client::Certificate::from_pem(ca));
+        }
+        match (&tls.client_cert_pem, &tls.client_key_pem) {
+            (Some(cert), Some(key)) => {
+                options_tls = options_tls.identity(etcd_client::Identity::from_pem(cert, key))
+            }
+            (None, None) => {}
+            _ => {
+                return Err(crate::RegistryError::config(
+                    "TLS client certificate and key must be supplied together",
+                ))
+            }
+        }
+        options = options.with_tls(options_tls);
+    }
+    if let (Some(user), Some(password)) = (&config.user, &config.password) {
+        options = options.with_user(user, password);
+    }
+    tokio::time::timeout(
+        timeout,
+        etcd_client::Client::connect(config.endpoints(), Some(options)),
+    )
+    .await
+    .map_err(|_| crate::RegistryError::timeout("etcd connect"))?
+    .map_err(|e| crate::RegistryError::connection(e.to_string()))
+}
+
+/// PEM credentials. Keep private keys out of committed configuration.
+#[derive(Clone, Deserialize, Serialize, Debug, Default)]
+pub struct EtcdTlsConfig {
+    pub domain_name: Option<String>,
+    pub ca_pem: Option<String>,
+    pub client_cert_pem: Option<String>,
+    pub client_key_pem: Option<String>,
 }

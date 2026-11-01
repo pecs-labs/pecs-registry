@@ -28,6 +28,16 @@ pub type EventStream = Pin<Box<dyn Stream<Item = ServiceEvent> + Send>>;
 /// 均通过实现此 Trait 接入系统。
 #[async_trait]
 pub trait Registry: Send + Sync {
+    /// Whether the local registration has been confirmed and remains leased.
+    fn is_registered(&self) -> bool {
+        true
+    }
+
+    /// The stream begins with an authoritative snapshot and preserves revision order.
+    fn watch_includes_snapshot(&self) -> bool {
+        false
+    }
+
     /// 注册本地服务实例，并启动自动续约与自愈保活心跳
     async fn register(&self, instance: &ServiceInstance) -> RegistryResult<()>;
 
