@@ -18,6 +18,9 @@ use tonic::{Request, Response, Status};
 #[derive(Default)]
 struct State {
     auth_calls: AtomicUsize,
+    deleted: AtomicBool,
+    fail_delete: AtomicBool,
+    revoke_calls: AtomicUsize,
     range_calls: AtomicUsize,
     minimum_token: AtomicUsize,
     deny: AtomicBool,
@@ -166,6 +169,15 @@ impl PbKvService for Mock {
     ) -> Result<Response<PbRangeResponse>, Status> {
         self.0.range_calls.fetch_add(1, Ordering::SeqCst);
         self.authorize(&request)?;
+        if self.0.deleted.load(Ordering::SeqCst) {
+            return Ok(Response::new(PbRangeResponse {
+                header: Some(PbResponseHeader {
+                    revision: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        }
         let instance = ServiceInstance::new_http(
             "node-1",
             "test",
@@ -186,14 +198,29 @@ impl PbKvService for Mock {
             ..Default::default()
         }))
     }
-    async fn put(&self, _: Request<PbPutRequest>) -> Result<Response<PbPutResponse>, Status> {
-        Err(Status::unimplemented("unused mock RPC"))
+    async fn put(&self, request: Request<PbPutRequest>) -> Result<Response<PbPutResponse>, Status> {
+        self.authorize(&request)?;
+        self.0.deleted.store(false, Ordering::SeqCst);
+        Ok(Response::new(PbPutResponse::default()))
     }
     async fn delete_range(
         &self,
-        _: Request<PbDeleteRequest>,
+        request: Request<PbDeleteRequest>,
     ) -> Result<Response<PbDeleteResponse>, Status> {
-        Err(Status::unimplemented("unused mock RPC"))
+        self.authorize(&request)?;
+        if self.0.fail_delete.load(Ordering::SeqCst) {
+            return Err(Status::unavailable("mock delete failure"));
+        }
+        assert_eq!(request.get_ref().key, b"/test/test/service/node-1");
+        assert!(
+            request.get_ref().range_end.is_empty(),
+            "must only delete the owned key"
+        );
+        self.0.deleted.store(true, Ordering::SeqCst);
+        Ok(Response::new(PbDeleteResponse {
+            deleted: 1,
+            ..Default::default()
+        }))
     }
     async fn txn(&self, _: Request<PbTxnRequest>) -> Result<Response<PbTxnResponse>, Status> {
         Err(Status::unimplemented("unused mock RPC"))
@@ -243,6 +270,50 @@ impl PbWatchService for Mock {
     }
 }
 
+#[tonic::async_trait]
+impl PbLeaseService for Mock {
+    type LeaseKeepAliveStream = ReceiverStream<Result<PbLeaseKeepAliveResponse, Status>>;
+    async fn lease_grant(
+        &self,
+        request: Request<PbLeaseGrantRequest>,
+    ) -> Result<Response<PbLeaseGrantResponse>, Status> {
+        Ok(Response::new(PbLeaseGrantResponse {
+            id: 42,
+            ttl: request.get_ref().ttl,
+            ..Default::default()
+        }))
+    }
+    async fn lease_revoke(
+        &self,
+        _: Request<PbLeaseRevokeRequest>,
+    ) -> Result<Response<PbLeaseRevokeResponse>, Status> {
+        assert!(
+            self.0.deleted.load(Ordering::SeqCst),
+            "must delete the registration key first"
+        );
+        self.0.revoke_calls.fetch_add(1, Ordering::SeqCst);
+        Err(Status::invalid_argument("etcdserver: user name is empty"))
+    }
+    async fn lease_keep_alive(
+        &self,
+        _: Request<tonic::Streaming<PbLeaseKeepAliveRequest>>,
+    ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
+        Err(Status::unimplemented("unused mock RPC"))
+    }
+    async fn lease_time_to_live(
+        &self,
+        _: Request<PbLeaseTimeToLiveRequest>,
+    ) -> Result<Response<PbLeaseTimeToLiveResponse>, Status> {
+        Err(Status::unimplemented("unused mock RPC"))
+    }
+    async fn lease_leases(
+        &self,
+        _: Request<PbLeaseLeasesRequest>,
+    ) -> Result<Response<PbLeaseLeasesResponse>, Status> {
+        Err(Status::unimplemented("unused mock RPC"))
+    }
+}
+
 async fn start() -> (EtcdRegistry, Arc<State>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(State::default());
     state.minimum_token.store(1, Ordering::SeqCst);
@@ -253,7 +324,8 @@ async fn start() -> (EtcdRegistry, Arc<State>, tokio::task::JoinHandle<()>) {
         tonic::transport::Server::builder()
             .add_service(PbAuthServer::new(mock.clone()))
             .add_service(PbKvServer::new(mock.clone()))
-            .add_service(PbWatchServer::new(mock))
+            .add_service(PbWatchServer::new(mock.clone()))
+            .add_service(PbLeaseServer::new(mock))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -261,6 +333,8 @@ async fn start() -> (EtcdRegistry, Arc<State>, tokio::task::JoinHandle<()>) {
     let registry = EtcdRegistry::new(RegistryConfig {
         host: "127.0.0.1".into(),
         port,
+        namespace: "test".into(),
+        group: "test".into(),
         timeout: 2,
         user: Some("test-user".into()),
         password: Some("test-password".into()),
@@ -353,5 +427,28 @@ async fn failed_authentication_is_returned_without_replaying_query() {
     assert!(registry.list_instances("service").await.is_err());
     assert_eq!(state.auth_calls.load(Ordering::SeqCst), 2);
     assert_eq!(state.range_calls.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn deregistration_removes_address_even_if_lease_revoke_rejects_auth() {
+    let (registry, state, task) = start().await;
+    let instance = ServiceInstance::new_http(
+        "node-1",
+        "test",
+        "test",
+        "service",
+        Endpoint::new("127.0.0.1", 8001),
+    );
+    registry.register(&instance).await.unwrap();
+    state.fail_delete.store(true, Ordering::SeqCst);
+    assert!(registry.deregister().await.is_err());
+    assert!(!state.deleted.load(Ordering::SeqCst));
+    state.fail_delete.store(false, Ordering::SeqCst);
+    registry.deregister().await.unwrap();
+    assert!(registry.list_instances("service").await.unwrap().is_empty());
+    assert_eq!(state.revoke_calls.load(Ordering::SeqCst), 1);
+    registry.deregister().await.unwrap();
+    assert_eq!(state.revoke_calls.load(Ordering::SeqCst), 1);
     task.abort();
 }

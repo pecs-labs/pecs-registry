@@ -388,11 +388,28 @@ impl Registry for EtcdRegistry {
             task.abort();
             let _ = task.await;
         }
-        let lease = self.lease_id.lock().await.take();
-        self.registered_key.lock().await.take();
+        let key = self.registered_key.lock().await.clone();
+        let lease = *self.lease_id.lock().await;
+        // KV deletion carries authentication even on clients whose Lease RPCs do
+        // not. Confirm address removal first; an empty lease may expire by TTL.
+        // Keep ownership metadata on failure so a caller can retry cleanup.
+        if let Some(key) = key {
+            self.authenticated(|mut client| {
+                let key = key.clone();
+                async move { client.delete(key, None).await }
+            })
+            .await?;
+            self.registered_key.lock().await.take();
+            tracing::info!(%key, "Removed service registration key");
+        }
         if let Some(id) = lease {
-            self.authenticated(|mut client| async move { client.lease_revoke(id).await })
-                .await?;
+            if let Err(error) = self
+                .authenticated(|mut client| async move { client.lease_revoke(id).await })
+                .await
+            {
+                tracing::warn!(lease_id = id, %error, "Registration key removed; empty lease will expire by TTL");
+            }
+            self.lease_id.lock().await.take();
         }
         Ok(())
     }
