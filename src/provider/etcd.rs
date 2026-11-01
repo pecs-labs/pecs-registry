@@ -15,6 +15,8 @@ use crate::traits::{EventStream, Registry, ServiceEvent};
 #[derive(Clone)]
 pub struct EtcdRegistry {
     ready: Arc<std::sync::atomic::AtomicBool>,
+    auth_epoch: Arc<std::sync::atomic::AtomicU64>,
+    auth_refresh: Arc<Mutex<()>>,
     config: RegistryConfig,
     client: Arc<Mutex<Option<Client>>>,
     registered_key: Arc<Mutex<Option<String>>>,
@@ -28,6 +30,8 @@ impl EtcdRegistry {
     pub fn new(config: RegistryConfig) -> Self {
         Self {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auth_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auth_refresh: Arc::new(Mutex::new(())),
             config,
             client: Arc::new(Mutex::new(None)),
             registered_key: Arc::new(Mutex::new(None)),
@@ -60,6 +64,61 @@ impl EtcdRegistry {
 
         *guard = Some(client.clone());
         Ok(client)
+    }
+
+    fn is_auth_expired(error: &etcd_client::Error) -> bool {
+        // gRPC UNAUTHENTICATED = 16. PermissionDenied is not a token expiry.
+        matches!(error, etcd_client::Error::GRpcStatus(status) if status.code() as i32 == 16)
+    }
+
+    async fn refresh_auth(&self, failed_epoch: u64) -> RegistryResult<()> {
+        let _refresh = self.auth_refresh.lock().await;
+        if self.auth_epoch.load(std::sync::atomic::Ordering::Acquire) != failed_epoch {
+            return Ok(());
+        }
+        let client = self.get_or_connect_client().await?;
+        // refresh_token updates the token shared by all clones, including leases.
+        tokio::time::timeout(self.op_timeout(), client.refresh_token())
+            .await
+            .map_err(|_| RegistryError::timeout("etcd authentication refresh timeout"))?
+            .map_err(|error| {
+                RegistryError::connection(format!("etcd authentication refresh failed: {error}"))
+            })?;
+        self.auth_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        tracing::info!("etcd authentication refreshed");
+        Ok(())
+    }
+
+    /// Retry only an explicitly rejected authentication attempt, once. Callers use
+    /// this for discovery and stream creation, not arbitrary replay of writes.
+    async fn authenticated<T, F, Fut>(&self, mut operation: F) -> RegistryResult<T>
+    where
+        F: FnMut(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<T, etcd_client::Error>>,
+    {
+        let epoch = self.auth_epoch.load(std::sync::atomic::Ordering::Acquire);
+        for attempt in 0..2 {
+            let client = self.get_or_connect_client().await?;
+            match tokio::time::timeout(self.op_timeout(), operation(client)).await {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error))
+                    if attempt == 0
+                        && Self::is_auth_expired(&error)
+                        && self
+                            .config
+                            .user
+                            .as_ref()
+                            .is_some_and(|user| !user.is_empty())
+                        && self.config.password.is_some() =>
+                {
+                    self.refresh_auth(epoch).await?;
+                }
+                Ok(Err(error)) => return Err(RegistryError::driver(error.to_string())),
+                Err(_) => return Err(RegistryError::timeout("etcd operation timeout")),
+            }
+        }
+        unreachable!("the second attempt always returns")
     }
 
     /// 构造实例存储键: `/{namespace}/{group}/{service_name}/{service_id}`
@@ -332,11 +391,8 @@ impl Registry for EtcdRegistry {
         let lease = self.lease_id.lock().await.take();
         self.registered_key.lock().await.take();
         if let Some(id) = lease {
-            let mut client = self.get_or_connect_client().await?;
-            tokio::time::timeout(self.op_timeout(), client.lease_revoke(id))
-                .await
-                .map_err(|_| RegistryError::timeout("撤销注册租约超时"))?
-                .map_err(|e| RegistryError::driver(e.to_string()))?;
+            self.authenticated(|mut client| async move { client.lease_revoke(id).await })
+                .await?;
         }
         Ok(())
     }
@@ -347,15 +403,17 @@ impl Registry for EtcdRegistry {
             return Ok(Vec::new());
         }
 
-        let mut client = self.get_or_connect_client().await?;
         let prefix = self.make_service_prefix(service_name);
-        let opts = GetOptions::new().with_prefix();
-
-        let get_fut = client.get(prefix.as_str(), Some(opts));
-        let resp = tokio::time::timeout(self.op_timeout(), get_fut)
-            .await
-            .map_err(|_| RegistryError::timeout(format!("etcd 查询服务 '{service_name}' 超时")))?
-            .map_err(|err| RegistryError::driver(format!("etcd 获取服务列表失败: {err}")))?;
+        let resp = self
+            .authenticated(|mut client| {
+                let prefix = prefix.clone();
+                async move {
+                    client
+                        .get(prefix, Some(GetOptions::new().with_prefix()))
+                        .await
+                }
+            })
+            .await?;
 
         let mut instances = Vec::new();
         for kv in resp.kvs() {
@@ -376,15 +434,17 @@ impl Registry for EtcdRegistry {
             return Ok(Box::pin(ReceiverStream::new(rx)));
         }
 
-        let mut client = self.get_or_connect_client().await?;
         let prefix = self.make_service_prefix(service_name);
-        let snapshot = tokio::time::timeout(
-            self.op_timeout(),
-            client.get(prefix.as_str(), Some(GetOptions::new().with_prefix())),
-        )
-        .await
-        .map_err(|_| RegistryError::timeout("watch snapshot 超时"))?
-        .map_err(|e| RegistryError::driver(e.to_string()))?;
+        let snapshot = self
+            .authenticated(|mut client| {
+                let prefix = prefix.clone();
+                async move {
+                    client
+                        .get(prefix, Some(GetOptions::new().with_prefix()))
+                        .await
+                }
+            })
+            .await?;
         let revision = snapshot
             .header()
             .ok_or_else(|| RegistryError::driver("missing revision"))?
@@ -394,19 +454,25 @@ impl Registry for EtcdRegistry {
             .iter()
             .filter_map(|kv| serde_json::from_slice(kv.value()).ok())
             .collect();
-        let opts = WatchOptions::new()
-            .with_prefix()
-            .with_start_revision(revision + 1);
-
-        let watch_fut = client.watch(prefix.as_str(), Some(opts));
-        let mut stream = tokio::time::timeout(self.op_timeout(), watch_fut)
-            .await
-            .map_err(|_| {
-                RegistryError::timeout(format!("建立 etcd watch ('{service_name}') 超时"))
-            })?
-            .map_err(|e| {
-                RegistryError::driver(format!("建立 etcd watch ('{service_name}') 失败: {e}"))
-            })?;
+        let mut stream = self
+            .authenticated(|mut client| {
+                let prefix = prefix.clone();
+                async move {
+                    client
+                        .watch(
+                            prefix,
+                            Some(
+                                WatchOptions::new()
+                                    .with_prefix()
+                                    .with_start_revision(revision + 1),
+                            ),
+                        )
+                        .await
+                }
+            })
+            .await?;
+        let watch_epoch = self.auth_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let this = self.clone();
 
         let svc_name = service_name.to_string();
 
@@ -463,6 +529,14 @@ impl Registry for EtcdRegistry {
                     }
                     Err(err) => {
                         tracing::warn!("⚠️ etcd watch 异常: {err} (service: {svc_name})");
+                        if Self::is_auth_expired(&err)
+                            && this.config.user.is_some()
+                            && this.config.password.is_some()
+                        {
+                            if let Err(error) = this.refresh_auth(watch_epoch).await {
+                                tracing::warn!(%error, "etcd watch authentication refresh failed");
+                            }
+                        }
                         break;
                     }
                 }
