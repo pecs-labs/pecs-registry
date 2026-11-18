@@ -39,3 +39,35 @@ async fn zero_wait_budget_is_rejected_before_connection() {
         Err(pecs_registry::RegistryError::Config(_))
     ));
 }
+
+#[cfg(feature = "etcd")]
+#[tokio::test]
+async fn claims_reject_disabled_service_invalid_resources_and_retention() {
+    use pecs_registry::{
+        lock::{LockConfig, LockService},
+        RegistryError,
+    };
+    let disabled = LockService::new(Default::default(), Default::default()).unwrap();
+    assert!(matches!(
+        disabled.claim_once("runs/1", 60).await,
+        Err(RegistryError::Config(_))
+    ));
+    let enabled = LockService::new(
+        Default::default(),
+        LockConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for resource in ["", "a//b", "../a", "a/./b"] {
+        assert!(matches!(
+            enabled.claim_once(resource, 60).await,
+            Err(RegistryError::Config(_))
+        ));
+    }
+    assert!(matches!(
+        enabled.claim_once("runs/1", 0).await,
+        Err(RegistryError::Config(_))
+    ));
+}

@@ -274,21 +274,114 @@ Licensed under either of:
 at your option.
 
 
-## Distributed coordination
+## 分布式协调：锁与轮次认领
 
-`pecs_registry::lock::{LockService, LockConfig, LockGuard}` provides etcd lease-backed
-locks independently of the `Registry` trait. Each acquisition uses a separate lease;
-`release().await` confirms revocation, Drop cancels renewal and schedules cleanup.
-The guard exposes `lost()`, `is_lost()` and a fencing token from the ownership key's
-creation revision. Downstream storage must enforce fencing or idempotent conditional
-writes; leases alone do not protect against a paused former owner.
+`pecs_registry::lock::{LockService, LockConfig, LockGuard}` 提供独立于 `Registry` trait 的 etcd 协调能力，需启用 Cargo feature `etcd`。锁不使用 Local/Nacos provider，不因注册发现关闭而关闭，也不会降级为本地锁。实现见 [src/lock.rs](src/lock.rs)。
 
-Real-etcd regression tests (use an isolated instance):
+### 初始化与配置
+
+```rust
+use pecs_registry::{RegistryConfig, RegistryResult, lock::{LockConfig, LockService}};
+
+fn create_locks() -> RegistryResult<LockService> {
+    LockService::new(
+        RegistryConfig {
+            host: "http://127.0.0.1:2379".into(),
+            ..Default::default()
+        },
+        LockConfig {
+            enabled: true,
+            prefix: "/pecs/production/locks".into(),
+            ..Default::default()
+        },
+    )
+}
+```
+
+复用同一个 Service 或其 clone，共享连接；每次获取仍使用独立 lease。连接支持单 URL、逗号分隔端点、用户名密码，以及 `RegistryConfig.tls` 的 PEM 参数 `domain_name`、`ca_pem`、`client_cert_pem`、`client_key_pem`。初始化只校验配置，连接在首次调用时建立。
+
+| `LockConfig` 字段 | 库默认值 | 含义 |
+| --- | --- | --- |
+| `enabled` | `false` | 禁用时获取锁和认领均返回配置错误 |
+| `prefix` | `/pecs/dev/locks` | 协调资源前缀；同环境竞争者须一致，不同环境须隔离 |
+| `lease_ttl_secs` | `30` | 执行锁租约 TTL，后台自动续租；不是业务超时 |
+| `acquire_timeout_ms` | `3000` | 默认等待预算，覆盖 Lock 与所有权读取 |
+| `rpc_timeout_ms` | `3000` | lease、所有权读取、认领事务及释放等 RPC 的超时预算 |
+
+TTL 至少 3 秒，两个超时字段须大于 0，`rpc_timeout_ms` 必须小于 TTL 毫秒数的三分之一；前缀不能只有 `/`。资源名不能为空，不能包含空路径段、`.` 或 `..`。最终名称为 `{prefix}/{resource}`；`RegistryConfig.namespace/group` 不会自动拼进锁名，环境隔离需显式放进 prefix。
+
+### 接口契约
+
+| 接口 | 行为 |
+| --- | --- |
+| `acquire(resource)` | 使用配置中的等待预算获取执行锁，返回不可 Clone 的 Guard |
+| `acquire_with_timeout(resource, Duration)` | 覆盖本次等待预算；必须大于 0，是有界排队，不是立即返回的 try-lock |
+| `guard.lost().await` / `guard.is_lost()` | 感知续租失败或本地确认过期；失效 Guard 不可恢复使用 |
+| `guard.fencing_token()` | 所有权 key 的 `create_revision`；下游须原子校验才能拒绝旧执行者写入 |
+| `guard.release().await` | 消耗 Guard，等待 revoke 的服务端确认；失败返回错误 |
+| Drop Guard | 通知后台停止续租并尽力 revoke；无法等待释放确认，失败时等待服务端 TTL 回收 |
+| `claim_once(resource, retention_secs)` | 原子认领一个名称，返回是否本次成功；保留秒数必须大于 0 |
+
+连接和 lease 申请另有超时，不包含在获取锁的等待预算里。Guard 必须存活至受保护业务结束；只写 `locks.acquire(...).await?;` 会立即丢弃它。每次获取的 lease 独立，锁不可重入，避免外层和业务层再次获取同一资源。
+
+### `claim_once` 的保证与限制
+
+认领通过 `version(key) == 0` 条件事务写入，记录使用独立的有限期 lease，不自动续租，也不依赖执行锁 lease。因此执行锁释放、业务取消或进程崩溃不会主动删除认领记录。
+
+| 返回值/事件 | 调用方应如何处理 |
+| --- | --- |
+| `Ok(true)` | 当前调用认领成功，可以开始这次尝试 |
+| `Ok(false)` | 已有记录，跳过本次执行 |
+| `Err(...)` | 跳过执行；事务可能已提交，不能把错误当作“尚未认领” |
+| 认领后失败或崩溃 | 保留记录，本轮不自动接管/重试 |
+| 记录过期、被删除或历史数据丢失 | 名称可再次认领；不提供永久去重或历史重放保护 |
+
+服务端明确拒绝事务时会尽力回收本次未使用的 lease；事务错误或超时结果不确定时保留 lease 等待过期，避免撤销可能已提交的记录。认领记录只是一次**尝试**，不记录业务完成结果，也不是幂等结果缓存。
+
+锁解决执行互斥，认领解决保留期内同一名称重复尝试。只用认领无法阻止跨周期长任务重叠，只用锁无法阻止释放后的串行重跑。通用作业入口应组合使用，并以稳定任务名和计划周期组成认领名称。保留期应覆盖执行超时及预期延迟，不能把资源名、执行锁 lease 与认领 lease 混用。
+
+### 组合使用示例
+
+以下示例在获取锁后认领指定轮次，监听失锁，并以 60 秒限制认领及业务执行。调用方提供稳定的 `slot`，业务 Future 内的远程写入仍需幂等保护。
+
+```rust
+use std::{future::Future, time::Duration};
+use pecs_registry::{RegistryError, RegistryResult, lock::LockService};
+
+async fn run_tick(
+    locks: &LockService,
+    slot: i64,
+    work: impl Future<Output = RegistryResult<()>>,
+) -> RegistryResult<()> {
+    let guard = locks.acquire_with_timeout(
+        "jobs/catalog", Duration::from_millis(100),
+    ).await?;
+    let attempt = async {
+        if !locks.claim_once(&format!("job-runs/catalog/{slot}"), 7200).await? {
+            return Ok(());
+        }
+        work.await
+    };
+    let result = tokio::select! {
+        biased;
+        _ = guard.lost() => Err(RegistryError::driver("job lock lost")),
+        result = tokio::time::timeout(Duration::from_secs(60), attempt) =>
+            result.unwrap_or_else(|_| Err(RegistryError::timeout("job execution"))),
+    };
+    let released = guard.release().await;
+    result?;
+    released
+}
+```
+
+丢弃 Future 无法撤回已经提交的 RPC，也无法停止业务自行 spawn 的工作。下游仍需幂等键、条件更新或原子 fencing；锁与认领不能承诺业务副作用严格执行一次。fencing token 依赖同一 etcd 历史的 revision 顺序，集群恢复或重建时需另行处理 epoch/revision 边界。
+
+### 验证与排查
 
 ```sh
+cargo test -p pecs-registry
+# 仅对隔离的 etcd 运行；这些测试默认 ignored。
 ETCD_TEST_ENDPOINT=http://127.0.0.1:12379 cargo test -p pecs-registry --all-features --test etcd_coordination_test -- --ignored
 ```
 
-Connection configuration accepts single URLs, comma-separated endpoints and optional
-`tls` PEM credentials (`domain_name`, `ca_pem`, `client_cert_pem`, `client_key_pem`).
-Registration now awaits the first confirmed write and returns errors to callers.
+[协调测试](tests/etcd_coordination_test.rs)覆盖竞争、跨 TTL 续租、Drop/取消清理、fencing 顺序、撤销后失锁，以及认领竞争、独立租约和到期回收。普通测试通过不代表真实 etcd 集成测试已执行。连接不可用时检查端点、认证/TLS 和多数派可用性；重复执行时先核对所有竞争者的 prefix、resource、轮次算法及记录保留期。

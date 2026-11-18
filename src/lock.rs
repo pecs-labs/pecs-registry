@@ -1,6 +1,6 @@
 //! Lease-backed coordination, independent of the Registry provider contract.
 use crate::{RegistryConfig, RegistryError, RegistryResult};
-use etcd_client::{Client, GetOptions, LockOptions};
+use etcd_client::{Client, Compare, GetOptions, LockOptions, PutOptions, Txn, TxnOp};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -51,6 +51,69 @@ impl LockService {
             config,
         })
     }
+    /// Atomically claim a named occurrence for a bounded retention period.
+    /// Returns false when already claimed. This records an attempt, not success:
+    /// cancellation/crash after the claim does not permit another attempt until expiry.
+    /// Use a separate resource namespace from locks. Ambiguous RPC failures must
+    /// skip execution; the claim may have committed and will expire naturally.
+    pub async fn claim_once(&self, resource: &str, retention_secs: i64) -> RegistryResult<bool> {
+        if retention_secs <= 0 {
+            return Err(RegistryError::config("claim retention must be positive"));
+        }
+        self.validate_resource(resource)?;
+        let rpc = Duration::from_millis(self.config.rpc_timeout_ms);
+        let mut client = self.connected_client().await?;
+        let lease = tokio::time::timeout(rpc, client.lease_grant(retention_secs, None))
+            .await
+            .map_err(|_| RegistryError::timeout("claim lease grant"))?
+            .map_err(|e| RegistryError::driver(e.to_string()))?;
+        let key = format!("{}/{}", self.config.prefix.trim_end_matches('/'), resource);
+        let txn = Txn::new()
+            .when(vec![Compare::version(
+                key.clone(),
+                etcd_client::CompareOp::Equal,
+                0,
+            )])
+            .and_then(vec![TxnOp::put(
+                key,
+                "claimed",
+                Some(PutOptions::new().with_lease(lease.id())),
+            )]);
+        let response = tokio::time::timeout(rpc, client.txn(txn))
+            .await
+            .map_err(|_| RegistryError::timeout("claim transaction"))?
+            .map_err(|e| RegistryError::driver(e.to_string()))?;
+        if !response.succeeded() {
+            // A definite rejected transaction never attached this lease to a key.
+            let _ = tokio::time::timeout(rpc, client.lease_revoke(lease.id())).await;
+        }
+        Ok(response.succeeded())
+    }
+
+    fn validate_resource(&self, resource: &str) -> RegistryResult<()> {
+        if !self.config.enabled {
+            return Err(RegistryError::config("distributed lock disabled"));
+        }
+        if resource.is_empty()
+            || resource
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return Err(RegistryError::config("invalid lock resource"));
+        }
+        Ok(())
+    }
+
+    async fn connected_client(&self) -> RegistryResult<Client> {
+        let mut connection = self.connection.clone();
+        connection.timeout = (self.config.rpc_timeout_ms / 1000).max(1);
+        let mut cached = self.client.lock().await;
+        if cached.is_none() {
+            *cached = Some(crate::config::connect_etcd(&connection).await?);
+        }
+        Ok(cached.as_ref().unwrap().clone())
+    }
+
     /// Acquire using the configured wait budget. Connection and lease allocation
     /// have separate RPC deadlines; the wait budget covers Lock and ownership Get.
     pub async fn acquire(&self, resource: &str) -> RegistryResult<LockGuard> {
@@ -71,26 +134,9 @@ impl LockService {
         if wait_timeout.is_zero() {
             return Err(RegistryError::config("lock wait timeout must be positive"));
         }
-        if !self.config.enabled {
-            return Err(RegistryError::config("distributed lock disabled"));
-        }
-        if resource.is_empty()
-            || resource
-                .split('/')
-                .any(|s| s.is_empty() || s == "." || s == "..")
-        {
-            return Err(RegistryError::config("invalid lock resource"));
-        }
+        self.validate_resource(resource)?;
         let rpc = Duration::from_millis(self.config.rpc_timeout_ms);
-        let mut connection = self.connection.clone();
-        connection.timeout = rpc.as_secs().max(1);
-        let mut client = {
-            let mut cached = self.client.lock().await;
-            if cached.is_none() {
-                *cached = Some(crate::config::connect_etcd(&connection).await?);
-            }
-            cached.as_ref().unwrap().clone()
-        };
+        let mut client = self.connected_client().await?;
         let grant_started = tokio::time::Instant::now();
         let lease = tokio::time::timeout(rpc, client.lease_grant(self.config.lease_ttl_secs, None))
             .await

@@ -150,3 +150,31 @@ async fn registration_confirmed_renewed_and_deregistered() {
         Some(ServiceEvent::Delete { .. })
     ));
 }
+
+#[tokio::test]
+#[ignore = "requires isolated etcd; set ETCD_TEST_ENDPOINT"]
+async fn occurrence_claim_is_atomic_independent_of_lock_and_expires() {
+    let prefix = prefix();
+    let first = service(prefix.clone());
+    let second = service(prefix);
+    let (a, b) = tokio::join!(
+        first.claim_once("runs/task/1", 3),
+        second.claim_once("runs/task/1", 3),
+    );
+    assert_ne!(a.unwrap(), b.unwrap(), "exactly one contender must claim");
+    let guard = first.acquire("jobs/task").await.unwrap();
+    guard.release().await.unwrap();
+    assert!(!second.claim_once("runs/task/1", 3).await.unwrap());
+    assert!(second.claim_once("runs/task/2", 3).await.unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if first.claim_once("runs/task/1", 3).await.unwrap() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "claim did not expire"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
