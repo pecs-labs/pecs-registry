@@ -51,6 +51,7 @@ impl ServiceDirectory {
                 let current = directory.get_instances(&name);
                 let next: std::collections::HashMap<_, _> = current
                     .iter()
+                    .filter(|i| i.enabled)
                     .map(|i| (i.service_id.clone(), i.clone()))
                     .collect();
                 let mut changes = Vec::new();

@@ -33,7 +33,7 @@ pub struct ServiceDirectory {
 
 impl ServiceDirectory {
     pub fn new(registry: Arc<dyn Registry>) -> Self {
-        Self::with_reconcile_interval(registry, Duration::from_secs(60))
+        Self::with_reconcile_interval(registry, Duration::from_secs(300))
     }
 
     pub fn with_reconcile_interval(registry: Arc<dyn Registry>, interval: Duration) -> Self {
@@ -148,7 +148,24 @@ impl ServiceDirectory {
             return Ok(self.get_instances(service_name));
         }
         // 2. 首次全量拉取对齐（支持注册中心不可用时的本地磁盘快照容灾降级）
-        let shared_instances = match self.registry.list_instances(service_name).await {
+        //    对支持原子快照+版本续传的提供者（如 etcd），直接复用 watch 首帧 Reset，避免冷启动重复全量拉取。
+        let mut initial_stream: Option<crate::traits::EventStream> = None;
+        let fetched = if self.registry.watch_includes_snapshot() {
+            match self.registry.watch(service_name).await {
+                Ok(mut stream) => match stream.next().await {
+                    Some(ServiceEvent::Reset(remote_instances)) => {
+                        initial_stream = Some(stream);
+                        Ok(remote_instances)
+                    }
+                    _ => self.registry.list_instances(service_name).await,
+                },
+                Err(err) => Err(err),
+            }
+        } else {
+            self.registry.list_instances(service_name).await
+        };
+
+        let shared_instances = match fetched {
             Ok(remote_instances) => {
                 let shared = Arc::new(remote_instances);
                 self.persist_to_disk(service_name, shared.clone());
@@ -172,15 +189,22 @@ impl ServiceDirectory {
             next.insert(service_name.to_string(), shared_instances.clone());
             next
         });
+        self.updates
+            .send_modify(|version| *version = version.wrapping_add(1));
 
         // 3. 启动后台长连接 Watch 任务（如果当前网络不可用，Watch 循环会自动进入指数退避重试，直至注册中心恢复）
-        self.ensure_watcher_started(service_name).await;
+        self.ensure_watcher_started(service_name, initial_stream)
+            .await;
 
         Ok(shared_instances)
     }
 
     /// 确保针对指定服务的 Watch 监听任务正在运行
-    async fn ensure_watcher_started(&self, service_name: &str) {
+    async fn ensure_watcher_started(
+        &self,
+        service_name: &str,
+        initial_stream: Option<crate::traits::EventStream>,
+    ) {
         let mut guard = self.active_watches.lock().await;
         if guard.contains_key(service_name) {
             return;
@@ -189,8 +213,11 @@ impl ServiceDirectory {
         let cancel_token = CancellationToken::new();
         guard.insert(service_name.to_string(), cancel_token.clone());
 
-        // 立即尝试建立首次长连接 Watch，确保在返回前已完成订阅
-        let initial_stream = self.registry.watch(service_name).await.ok();
+        // 若尚未建立初始流，则立即尝试建立首次长连接 Watch，确保在返回前已完成订阅
+        let initial_stream = match initial_stream {
+            Some(stream) => Some(stream),
+            None => self.registry.watch(service_name).await.ok(),
+        };
 
         let this = self.clone();
         let svc_name = service_name.to_string();
@@ -209,6 +236,8 @@ impl ServiceDirectory {
         mut initial_stream: Option<crate::traits::EventStream>,
     ) {
         let mut retry_backoff = Duration::from_secs(1);
+        let mut announced = false;
+        let mut from_reconcile = false;
 
         while !cancel.is_cancelled() {
             let mut event_stream = if let Some(stream) = initial_stream.take() {
@@ -217,6 +246,7 @@ impl ServiceDirectory {
                 match self.registry.watch(&service_name).await {
                     Ok(s) => s,
                     Err(err) => {
+                        from_reconcile = false;
                         tracing::warn!("⚠️ 建立服务 '{service_name}' Watch 失败: {err}，{retry_backoff:?}后重试");
                         tokio::select! {
                             _ = cancel.cancelled() => return,
@@ -230,7 +260,13 @@ impl ServiceDirectory {
             };
 
             retry_backoff = Duration::from_secs(1);
-            tracing::info!("📡 已建立针对服务 '{service_name}' 的注册中心事件监听");
+            if !announced || !from_reconcile {
+                tracing::info!("📡 已建立针对服务 '{service_name}' 的注册中心事件监听");
+                announced = true;
+            } else {
+                tracing::debug!("🔄 服务 '{service_name}' 周期校准重建注册中心事件监听");
+            }
+            from_reconcile = false;
 
             let mut reconcile_interval = tokio::time::interval(self.reconcile_interval);
             reconcile_interval.tick().await;
@@ -244,7 +280,10 @@ impl ServiceDirectory {
                     _ = reconcile_interval.tick() => {
                         // Revision-aware providers resnapshot through the stream, avoiding stale
                         // queued events overwriting a newer out-of-band list result.
-                        if self.registry.watch_includes_snapshot() { break; }
+                        if self.registry.watch_includes_snapshot() {
+                            from_reconcile = true;
+                            break;
+                        }
                         // 全量静默校准，防止网络抖动丢包
                         if let Ok(latest) = self.registry.list_instances(&service_name).await {
                             self.apply_event(&service_name, ServiceEvent::Reset(latest));

@@ -31,6 +31,8 @@ impl Default for LockConfig {
 #[derive(Clone)]
 pub struct LockService {
     client: std::sync::Arc<tokio::sync::Mutex<Option<Client>>>,
+    auth_refresh: std::sync::Arc<tokio::sync::Mutex<()>>,
+    auth_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     connection: RegistryConfig,
     config: LockConfig,
 }
@@ -48,9 +50,65 @@ impl LockService {
         }
         Ok(Self {
             client: Default::default(),
+            auth_refresh: Default::default(),
+            auth_epoch: Default::default(),
             connection,
             config,
         })
+    }
+
+    fn is_auth_expired(error: &etcd_client::Error) -> bool {
+        // gRPC UNAUTHENTICATED = 16. PermissionDenied is not a token expiry.
+        matches!(error, etcd_client::Error::GRpcStatus(status) if status.code() as i32 == 16)
+    }
+
+    async fn refresh_auth(&self, failed_epoch: u64, rpc: Duration) -> RegistryResult<()> {
+        let _refresh = self.auth_refresh.lock().await;
+        if self.auth_epoch.load(std::sync::atomic::Ordering::Acquire) != failed_epoch {
+            return Ok(());
+        }
+        let client = self.connected_client().await?;
+        tokio::time::timeout(rpc, client.refresh_token())
+            .await
+            .map_err(|_| RegistryError::timeout("lock etcd authentication refresh timeout"))?
+            .map_err(|error| {
+                RegistryError::connection(format!(
+                    "lock etcd authentication refresh failed: {error}"
+                ))
+            })?;
+        self.auth_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        tracing::info!("lock etcd authentication refreshed");
+        Ok(())
+    }
+
+    async fn authenticated<T, F, Fut>(
+        &self,
+        rpc: Duration,
+        timeout_label: &'static str,
+        mut operation: F,
+    ) -> RegistryResult<T>
+    where
+        F: FnMut(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<T, etcd_client::Error>>,
+    {
+        let epoch = self.auth_epoch.load(std::sync::atomic::Ordering::Acquire);
+        for attempt in 0..2 {
+            let client = self.connected_client().await?;
+            match tokio::time::timeout(rpc, operation(client)).await {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error))
+                    if attempt == 0
+                        && Self::is_auth_expired(&error)
+                        && self.connection.has_auth_credentials() =>
+                {
+                    self.refresh_auth(epoch, rpc).await?;
+                }
+                Ok(Err(error)) => return Err(RegistryError::driver(error.to_string())),
+                Err(_) => return Err(RegistryError::timeout(timeout_label)),
+            }
+        }
+        unreachable!("the second attempt always returns")
     }
     /// Atomically claim a named occurrence for a bounded retention period.
     /// Returns false when already claimed. This records an attempt, not success:
@@ -69,24 +127,29 @@ impl LockService {
             .map_err(|_| RegistryError::timeout("claim lease grant"))?
             .map_err(|e| RegistryError::driver(e.to_string()))?;
         let key = format!("{}/{}", self.config.prefix.trim_end_matches('/'), resource);
-        let txn = Txn::new()
-            .when(vec![Compare::version(
-                key.clone(),
-                etcd_client::CompareOp::Equal,
-                0,
-            )])
-            .and_then(vec![TxnOp::put(
-                key,
-                "claimed",
-                Some(PutOptions::new().with_lease(lease.id())),
-            )]);
-        let response = tokio::time::timeout(rpc, client.txn(txn))
-            .await
-            .map_err(|_| RegistryError::timeout("claim transaction"))?
-            .map_err(|e| RegistryError::driver(e.to_string()))?;
+        let lease_id = lease.id();
+        let response = self
+            .authenticated(rpc, "claim transaction", |mut client| {
+                let key = key.clone();
+                async move {
+                    let txn = Txn::new()
+                        .when(vec![Compare::version(
+                            key.clone(),
+                            etcd_client::CompareOp::Equal,
+                            0,
+                        )])
+                        .and_then(vec![TxnOp::put(
+                            key,
+                            "claimed",
+                            Some(PutOptions::new().with_lease(lease_id)),
+                        )]);
+                    client.txn(txn).await
+                }
+            })
+            .await?;
         if !response.succeeded() {
             // A definite rejected transaction never attached this lease to a key.
-            let _ = tokio::time::timeout(rpc, client.lease_revoke(lease.id())).await;
+            let _ = tokio::time::timeout(rpc, client.lease_revoke(lease_id)).await;
         }
         Ok(response.succeeded())
     }
@@ -143,15 +206,21 @@ impl LockService {
             .await
             .map_err(|_| RegistryError::timeout("lock lease grant"))?
             .map_err(|e| RegistryError::driver(e.to_string()))?;
+        let name = format!("{}/{}", self.config.prefix.trim_end_matches('/'), resource);
+        let lock_key = std::sync::Arc::new(std::sync::Mutex::new(
+            format!("{name}/{:x}", lease.id()).into_bytes(),
+        ));
         let stop = CancellationToken::new();
         let validity = std::sync::Arc::new(LeaseValidity::new(grant_started, lease.ttl())?);
         let task = spawn_lease(
+            self.clone(),
             client.clone(),
             lease.id(),
             lease.ttl(),
             rpc,
             stop.clone(),
             validity.clone(),
+            lock_key.clone(),
         );
         // Guard exists before the first cancellable await following lease allocation.
         let mut guard = LockGuard {
@@ -160,22 +229,38 @@ impl LockService {
             task: Some(task),
             token: 0,
         };
-        let name = format!("{}/{}", self.config.prefix.trim_end_matches('/'), resource);
+        let lease_id = lease.id();
         let acquire = async {
-            let response = client
-                .lock(name, Some(LockOptions::new().with_lease(lease.id())))
+            let epoch = self.auth_epoch.load(std::sync::atomic::Ordering::Acquire);
+            let response = match client
+                .lock(name.clone(), Some(LockOptions::new().with_lease(lease_id)))
                 .await
-                .map_err(|e| RegistryError::driver(e.to_string()))?;
+            {
+                Ok(resp) => resp,
+                Err(error)
+                    if Self::is_auth_expired(&error) && self.connection.has_auth_credentials() =>
+                {
+                    self.refresh_auth(epoch, rpc).await?;
+                    client
+                        .lock(name, Some(LockOptions::new().with_lease(lease_id)))
+                        .await
+                        .map_err(|e| RegistryError::driver(e.to_string()))?
+                }
+                Err(error) => return Err(RegistryError::driver(error.to_string())),
+            };
             let key = response.key().to_vec();
-            let result = tokio::time::timeout(rpc, client.get(key, Some(GetOptions::new())))
-                .await
-                .map_err(|_| RegistryError::timeout("lock ownership read"))?
-                .map_err(|e| RegistryError::driver(e.to_string()))?;
+            *lock_key.lock().unwrap() = key.clone();
+            let result = self
+                .authenticated(rpc, "lock ownership read", |mut client| {
+                    let key = key.clone();
+                    async move { client.get(key, Some(GetOptions::new())).await }
+                })
+                .await?;
             let kv = result
                 .kvs()
                 .first()
                 .ok_or_else(|| RegistryError::driver("lock ownership lost"))?;
-            if kv.lease() != lease.id() {
+            if kv.lease() != lease_id {
                 return Err(RegistryError::driver("lock lease mismatch"));
             }
             Ok(kv.create_revision())
@@ -280,12 +365,14 @@ impl LeaseValidity {
 }
 
 fn spawn_lease(
+    service: LockService,
     mut client: Client,
     id: i64,
     ttl: i64,
     rpc: Duration,
     stop: CancellationToken,
     validity: std::sync::Arc<LeaseValidity>,
+    lock_key: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 ) -> JoinHandle<RegistryResult<()>> {
     tokio::spawn(async move {
         let renew = async {
@@ -332,15 +419,51 @@ fn spawn_lease(
             result = renew => { if let Err(error) = result { tracing::warn!(%error, "Distributed lock lost"); } },
         }
         validity.lost.cancel();
-        // Revoke removes the ownership key AND any pending Lock waiter for this lease.
-        let result = tokio::time::timeout(rpc, client.lease_revoke(id))
+        // Unlock carries authentication even on etcd-client versions whose Lease RPCs
+        // omit the auth token (e.g. etcd-client 0.19). Removing the lock key first
+        // immediately releases ownership for contenders; best-effort lease_revoke then
+        // reclaims the empty lease (or lets it expire harmlessly by TTL).
+        let key = lock_key.lock().unwrap().clone();
+        let unlock_res = service
+            .authenticated(rpc, "lock unlock", |mut client| {
+                let key = key.clone();
+                async move { client.unlock(key).await }
+            })
+            .await;
+
+        let revoke_res = tokio::time::timeout(rpc, client.lease_revoke(id))
             .await
             .map_err(|_| RegistryError::timeout("lock release"))
             .and_then(|result| result.map_err(|e| RegistryError::driver(e.to_string())));
-        if let Err(error) = &result {
-            tracing::warn!(%error, lease_id = id, "Lock cleanup failed; waiting for lease expiry");
+
+        match (unlock_res, revoke_res) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Ok(_), Err(error)) => {
+                tracing::debug!(
+                    %error,
+                    lease_id = id,
+                    "Lock key unlocked; empty lease will expire by TTL"
+                );
+                Ok(())
+            }
+            (Err(error), Ok(_)) => {
+                tracing::debug!(
+                    %error,
+                    lease_id = id,
+                    "Lock unlock failed but lease revoked cleanly"
+                );
+                Ok(())
+            }
+            (Err(unlock_err), Err(revoke_err)) => {
+                tracing::warn!(
+                    unlock_error = %unlock_err,
+                    revoke_error = %revoke_err,
+                    lease_id = id,
+                    "Lock cleanup failed; waiting for lease expiry"
+                );
+                Err(unlock_err)
+            }
         }
-        result.map(|_| ())
     })
 }
 

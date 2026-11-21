@@ -105,12 +105,7 @@ impl EtcdRegistry {
                 Ok(Err(error))
                     if attempt == 0
                         && Self::is_auth_expired(&error)
-                        && self
-                            .config
-                            .user
-                            .as_ref()
-                            .is_some_and(|user| !user.is_empty())
-                        && self.config.password.is_some() =>
+                        && self.config.has_auth_credentials() =>
                 {
                     self.refresh_auth(epoch).await?;
                 }
@@ -546,10 +541,7 @@ impl Registry for EtcdRegistry {
                     }
                     Err(err) => {
                         tracing::warn!("⚠️ etcd watch 异常: {err} (service: {svc_name})");
-                        if Self::is_auth_expired(&err)
-                            && this.config.user.is_some()
-                            && this.config.password.is_some()
-                        {
+                        if Self::is_auth_expired(&err) && this.config.has_auth_credentials() {
                             if let Err(error) = this.refresh_auth(watch_epoch).await {
                                 tracing::warn!(%error, "etcd watch authentication refresh failed");
                             }

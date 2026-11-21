@@ -106,3 +106,33 @@ async fn test_instance_listener_notification() {
     sleep(Duration::from_millis(50)).await;
     assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) > 0);
 }
+
+#[tokio::test]
+async fn test_select_instance_skips_disabled_instances() {
+    let local = Arc::new(LocalRegistry::new());
+    let service = Arc::new(RegistryService::new(local.clone()));
+
+    let mut disabled = ServiceInstance::simple("drain-svc", "127.0.0.1", 8081);
+    disabled.service_id = "inst-disabled".into();
+    disabled.enabled = false;
+
+    let mut active = ServiceInstance::simple("drain-svc", "127.0.0.1", 8082);
+    active.service_id = "inst-active".into();
+    active.enabled = true;
+
+    local.add_instance(disabled);
+    local.add_instance(active);
+
+    for _ in 0..5 {
+        let picked = service
+            .select_instance("drain-svc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(picked.service_id, "inst-active");
+    }
+
+    local.remove_instance("drain-svc", "inst-active");
+    sleep(Duration::from_millis(50)).await;
+    assert!(service.select_instance("drain-svc").await.unwrap().is_none());
+}

@@ -118,3 +118,26 @@ async fn discover_survives_backpressure_and_large_initial_snapshot() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn discover_stream_filters_and_removes_disabled_instances() {
+    let registry = Arc::new(LocalRegistry::new());
+    let directory = ServiceDirectory::new(registry.clone());
+
+    let mut inst = ServiceInstance::simple("drain-grpc", "127.0.0.1", 9101);
+    inst.service_id = "node-1".into();
+    registry.add_instance(inst.clone());
+
+    let mut stream = directory.discover_stream("drain-grpc").await.unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(Change::Insert(ref id, _))) if id == "node-1"
+    ));
+
+    inst.enabled = false;
+    directory.apply_event("drain-grpc", ServiceEvent::Upsert(inst));
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(Change::Remove(ref id))) if id == "node-1"
+    ));
+}

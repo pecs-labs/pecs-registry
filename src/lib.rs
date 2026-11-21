@@ -162,8 +162,19 @@ impl RegistryService {
         if instances.is_empty() {
             return Ok(None);
         }
+        if instances.iter().all(|inst| inst.enabled) {
+            return Ok(self.selector.select(ctx, &instances).cloned());
+        }
+        let enabled: Vec<ServiceInstance> = instances
+            .iter()
+            .filter(|inst| inst.enabled)
+            .cloned()
+            .collect();
+        if enabled.is_empty() {
+            return Ok(None);
+        }
 
-        let chosen = self.selector.select(ctx, &instances);
+        let chosen = self.selector.select(ctx, &enabled);
         Ok(chosen.cloned())
     }
 

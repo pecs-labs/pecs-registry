@@ -71,3 +71,21 @@ async fn claims_reject_disabled_service_invalid_resources_and_retention() {
         Err(RegistryError::Config(_))
     ));
 }
+
+#[test]
+fn has_auth_credentials_requires_non_empty_user_and_password() {
+    let mut cfg = RegistryConfig::default();
+    assert!(!cfg.has_auth_credentials());
+
+    cfg.user = Some("root".into());
+    cfg.password = Some(String::new());
+    assert!(!cfg.has_auth_credentials());
+
+    cfg.user = Some("   ".into());
+    cfg.password = Some("secret".into());
+    assert!(!cfg.has_auth_credentials());
+
+    cfg.user = Some("root".into());
+    cfg.password = Some("secret".into());
+    assert!(cfg.has_auth_credentials());
+}

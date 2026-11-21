@@ -108,6 +108,12 @@ impl Default for RegistryConfig {
 }
 
 impl RegistryConfig {
+    /// 是否配置了有效的用户名与密码认证凭据（任一为空则视为不启用密码认证）
+    pub fn has_auth_credentials(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| !u.trim().is_empty())
+            && self.password.as_ref().is_some_and(|p| !p.is_empty())
+    }
+
     /// 获取单点地址 URL
     pub fn endpoint(&self) -> String {
         self.endpoints().into_iter().next().unwrap_or_default()
@@ -162,8 +168,10 @@ pub(crate) async fn connect_etcd(
         }
         options = options.with_tls(options_tls);
     }
-    if let (Some(user), Some(password)) = (&config.user, &config.password) {
-        options = options.with_user(user, password);
+    if config.has_auth_credentials() {
+        if let (Some(user), Some(password)) = (&config.user, &config.password) {
+            options = options.with_user(user, password);
+        }
     }
     tokio::time::timeout(
         timeout,

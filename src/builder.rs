@@ -23,7 +23,7 @@ impl RegistryBuilder {
         Self {
             provider: None,
             selector: None,
-            reconcile_interval: Duration::from_secs(60),
+            reconcile_interval: Duration::from_secs(300),
             disk_cache_dir: None,
         }
     }
