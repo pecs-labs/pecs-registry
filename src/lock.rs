@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LockConfig {
+    #[serde(alias = "enable")]
     pub enabled: bool,
     pub prefix: String,
     pub lease_ttl_secs: i64,
