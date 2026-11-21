@@ -4,8 +4,6 @@ pub mod directory;
 pub mod discover;
 pub mod error;
 pub mod instance;
-#[cfg(feature = "etcd")]
-pub mod lock;
 pub mod provider;
 pub mod selector;
 pub mod traits;
